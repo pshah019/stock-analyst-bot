@@ -17,10 +17,13 @@ async function saveResultToSupabase(scan) {
       target_3: scan.t3,
       target_4: scan.t4,
       target_5: scan.t5,
+      h_div: scan.hDiv?.label || null,
+      d_div: scan.dDiv?.label || null,
+      combined_div: scan.cDiv?.label || null,
       analyzed_at: scan.timestamp || new Date().toISOString(),
     }]);
     if (error) console.warn("Supabase save error:", error.message);
-    else console.log(`✅ Saved ${scan.ticker} to Supabase`);
+    else console.log(`Saved ${scan.ticker} to Supabase`);
   } catch (e) {
     console.warn("Supabase save failed:", e.message);
   }
@@ -1486,44 +1489,45 @@ function computePlan(dData, hData, dSR, hSR, earningsDate, regime) {
   }
 
   // ═══ SAFEGUARD 4: MARKET REGIME ═══
+  // Market regime scoring DISABLED — grades based on pure chart technicals only
   let regimeAdj = null;
-  if (regime && direction !== "WAIT") {
-    // Use the best matching benchmark
-    // QQQ for tech-heavy names, IWM for small caps, SPY as fallback
-    const primary = regime.QQQ || regime.SPY;
-    const secondary = regime.SPY;
-    const r = primary || secondary;
 
-    if (r) {
-      if (direction === "CALLS" && r.direction === "BEARISH" && r.strength >= 3) {
-        const penalty = r.strength >= 5 ? -2 : -1;
-        grade = Math.max(1, grade + penalty);
-        regimeAdj = {
-          effect: "penalty", gradeAdj: penalty,
-          text: `🌍 MARKET HEADWIND — ${r.direction}\n\nBroad market is bearish (score ${r.score}). SPY ${regime.SPY ? `${regime.SPY.direction} (5d: ${regime.SPY.pct5d}%)` : "N/A"}, QQQ ${regime.QQQ ? `${regime.QQQ.direction} (5d: ${regime.QQQ.pct5d}%)` : "N/A"}.\n\n50-70% of a stock's short-term movement comes from the broad market. Buying calls against a bearish regime has lower probability. Grade ${penalty}.`
-        };
-      } else if (direction === "PUTS" && r.direction === "BULLISH" && r.strength >= 3) {
-        const penalty = r.strength >= 5 ? -2 : -1;
-        grade = Math.max(1, grade + penalty);
-        regimeAdj = {
-          effect: "penalty", gradeAdj: penalty,
-          text: `🌍 MARKET HEADWIND — ${r.direction}\n\nBroad market is bullish (score ${r.score}). SPY ${regime.SPY ? `${regime.SPY.direction} (5d: ${regime.SPY.pct5d}%)` : "N/A"}, QQQ ${regime.QQQ ? `${regime.QQQ.direction} (5d: ${regime.QQQ.pct5d}%)` : "N/A"}.\n\nBuying puts against a bullish regime has lower probability. Grade ${penalty}.`
-        };
-      } else if (direction === "CALLS" && r.direction === "BULLISH" && r.strength >= 3) {
-        const boost = r.strength >= 5 ? 1 : 0.5;
-        grade = Math.min(10, grade + boost);
-        regimeAdj = {
-          effect: "tailwind", gradeAdj: boost,
-          text: `🌍 MARKET TAILWIND — ${r.direction}\n\nBroad market confirms bullish (score ${r.score}). SPY ${regime.SPY ? `${regime.SPY.direction} (5d: ${regime.SPY.pct5d}%)` : "N/A"}, QQQ ${regime.QQQ ? `${regime.QQQ.direction} (5d: ${regime.QQQ.pct5d}%)` : "N/A"}.\n\nCalls aligned with market trend. Grade +${boost}.`
-        };
-      } else if (direction === "PUTS" && r.direction === "BEARISH" && r.strength >= 3) {
-        const boost = r.strength >= 5 ? 1 : 0.5;
-        grade = Math.min(10, grade + boost);
-        regimeAdj = {
-          effect: "tailwind", gradeAdj: boost,
-          text: `🌍 MARKET TAILWIND — ${r.direction}\n\nBroad market confirms bearish (score ${r.score}). SPY ${regime.SPY ? `${regime.SPY.direction} (5d: ${regime.SPY.pct5d}%)` : "N/A"}, QQQ ${regime.QQQ ? `${regime.QQQ.direction} (5d: ${regime.QQQ.pct5d}%)` : "N/A"}.\n\nPuts aligned with market trend. Grade +${boost}.`
-        };
-      }
+  // ═══ SAFEGUARD 5: RSI DIVERGENCE vs DIRECTION ═══
+  // If RSI divergence opposes the trade direction, penalize the grade
+  // Both TF opposing = -2, Daily only = -1.5, Hourly only = -1
+  // Hidden divergence = half penalty of regular/developing
+  const dDiv = detectDivergence(dData, 30);
+  const hDiv = detectDivergence(hData, 60);
+  const cDiv = combinedDivergence(dDiv, hDiv);
+  let divAdj = null;
+  if (direction !== "WAIT") {
+    const dOpp = (direction === "PUTS" && dDiv.type === "bullish") || (direction === "CALLS" && dDiv.type === "bearish");
+    const hOpp = (direction === "PUTS" && hDiv.type === "bullish") || (direction === "CALLS" && hDiv.type === "bearish");
+    const dBld = dDiv.label.startsWith("BLD");
+    const hBld = hDiv.label.startsWith("BLD");
+    // RSI MA contradicts = weaker divergence, halve penalty
+    const dWeak = dDiv.weakened;
+    const hWeak = hDiv.weakened;
+
+    if (dOpp && hOpp) {
+      let pen = (dBld && hBld) ? -1 : (dBld || hBld) ? -1.5 : -2;
+      if (dWeak && hWeak) pen = pen * 0.25; // both contradicted by RSI MA = barely matters
+      else if (dWeak || hWeak) pen = pen * 0.5; // one contradicted = half penalty
+      pen = Math.round(pen * 2) / 2; // round to nearest 0.5
+      grade = Math.max(1, grade + pen);
+      divAdj = { gradeAdj: pen, text: `⚠️ BOTH TF DIVERGENCE vs ${direction}\n\nHourly: ${hDiv.label} — ${hDiv.detail}\nDaily: ${dDiv.label} — ${dDiv.detail}\n\nBoth timeframes show RSI divergence opposing ${direction.toLowerCase()}.${(dWeak || hWeak) ? " (weakened — RSI MA not fully confirming)" : ""} Grade ${pen}.` };
+    } else if (dOpp) {
+      let pen = dBld ? -1 : -1.5;
+      if (dWeak) pen = pen * 0.5;
+      pen = Math.round(pen * 2) / 2;
+      grade = Math.max(1, grade + pen);
+      divAdj = { gradeAdj: pen, text: `⚠️ DAILY DIVERGENCE vs ${direction}\n\n${dDiv.label} — ${dDiv.detail}\n\nDaily RSI divergence opposes ${direction.toLowerCase()}.${dWeak ? " (RSI MA not confirming — weaker signal)" : ""} Grade ${pen}.` };
+    } else if (hOpp) {
+      let pen = hBld ? -0.5 : -1;
+      if (hWeak) pen = pen * 0.5;
+      pen = Math.round(pen * 2) / 2;
+      grade = Math.max(1, grade + pen);
+      divAdj = { gradeAdj: pen, text: `⚠️ HOURLY DIVERGENCE vs ${direction}\n\n${hDiv.label} — ${hDiv.detail}\n\nHourly RSI divergence opposes ${direction.toLowerCase()}.${hWeak ? " (RSI MA not confirming — weaker signal)" : ""} Grade ${pen}.` };
     }
   }
 
@@ -1535,7 +1539,7 @@ function computePlan(dData, hData, dSR, hSR, earningsDate, regime) {
   if (extremeWarning) confidence += ` | ${extremeWarning.severity === "critical" ? "🚨" : "⚠️"} ${extremeWarning.type === "oversold_bounce" ? "Oversold snap-back risk" : "Overbought reversal risk"}`;
   if (earningsAdj) confidence += ` | 📅 Earnings ${earningsAdj.daysUntil}d`;
   if (rsiCap) confidence += ` | ⛔ Grade capped from ${rsiCap.cappedFrom}`;
-  if (regimeAdj) confidence += ` | 🌍 ${regimeAdj.effect === "tailwind" ? "Regime tailwind" : "Regime headwind"}`;
+  if (divAdj) confidence += ` | ⚠️ Divergence vs ${direction} (${divAdj.gradeAdj})`;
 
   const targets = compute5Targets(direction, price, dData, hData, dSR, hSR, dATR, hATR, gapCtx, dPat);
 
@@ -1640,7 +1644,7 @@ function computePlan(dData, hData, dSR, hSR, earningsDate, regime) {
   const summary = { gapSummary, dirSummary, keySR, trendSummary, trendRange };
 
   return { direction, bias, alignment, grade, confidence, actionNow, entry, stop, entryDetail, targets, gapCtx, summary,
-    extremeWarning, earningsAdj, rsiCap, regimeAdj, reversalInfo, patternAdj: patternAdj !== 0 ? { adj: patternAdj, note: patternNote } : null,
+    extremeWarning, earningsAdj, rsiCap, regimeAdj, divAdj, dDiv, hDiv, cDiv, reversalInfo, patternAdj: patternAdj !== 0 ? { adj: patternAdj, note: patternNote } : null,
     categories: { trend: Math.round(trendScore * 10) / 10, entry: Math.round(entryScore * 10) / 10, confirm: Math.round(confirmScore * 10) / 10, late: latePenalty, align: alignBonus, raw: Math.round(rawGrade * 10) / 10 },
     daily: { ...daily, score: adjDailyScore, origScore: daily.score, rsi: dL.rsi?.toFixed(1), fastSMA: dL.fastSMA?.toFixed(2), slowSMA: dL.slowSMA?.toFixed(2), extraSMA: dL.extraSMA?.toFixed(2), sma200: dL.sma200?.toFixed(2), atr: dATR.toFixed(2), dir: dDir },
     hourly: { ...hourly, rsi: hL.rsi?.toFixed(1), fastSMA: hL.fastSMA?.toFixed(2), atr: hATR.toFixed(2), dir: hDir, vwap: vwap?.toFixed(2), vwapUB: vwapUB?.toFixed(2), vwapLB: vwapLB?.toFixed(2) },
@@ -1651,10 +1655,24 @@ function computePlan(dData, hData, dSR, hSR, earningsDate, regime) {
 function parseCSV(text) {
   const parsed = Papa.parse(text.trim(), { header: true, skipEmptyLines: true }); if (!parsed.data?.length) return null;
   const f = (...n) => { for (const x of n) { const r = Object.keys(parsed.data[0]).find(c => c.toLowerCase().trim().includes(x.toLowerCase())); if (r) return r; } return null; };
+  // Exact match helper — matches full column name exactly (case-insensitive, trimmed)
+  const fe = (...n) => { for (const x of n) { const r = Object.keys(parsed.data[0]).find(c => c.trim().toLowerCase() === x.toLowerCase()); if (r) return r; } return null; };
   const dc = f("time", "date"), oc = f("open"), hc = f("high"), lc = f("low"), cc = f("close"), vc = f("volume");
-  const fs = f("fast sma", "fastsma", "sma10"), ss = f("slow sma", "slowsma", "sma20"), s2 = f("200 sma", "200sma", "sma200"), es = f("extra sma", "extrasma", "sma50");
-  const rc = f("rsi"), rm = f("rsi-based ma", "rsima", "rsi ma", "rsi-based"), ru = f("upper bollinger", "upperbb", "upper bb"), rl = f("lower bollinger", "lowerbb", "lower bb");
-  const vw = f("vwap"), vu = f("upper vwap", "vwap upper", "upper band"), vl = f("lower vwap", "vwap lower", "lower band");
+  // SMA: support both old named format ("Fast SMA") and new generic format ("MA 1"=10, "MA 2"=20, "MA 3"=50, "MA 4"=200)
+  const fs = f("fast sma", "fastsma", "sma10") || fe("ma 1");
+  const ss = f("slow sma", "slowsma", "sma20") || fe("ma 2");
+  const es = f("extra sma", "extrasma", "sma50") || fe("ma 3");
+  const s2 = f("200 sma", "200sma", "sma200") || fe("ma 4");
+  // RSI: exact match first to avoid collisions, then fuzzy
+  const rc = fe("rsi") || f("rsi");
+  const rm = f("rsi-based ma", "rsima", "rsi ma", "rsi-based");
+  // RSI Bollinger Bands: must match "bollinger" to avoid colliding with VWAP "Upper Band #2"
+  const ru = f("upper bollinger", "upperbb", "upper bb");
+  const rl = f("lower bollinger", "lowerbb", "lower bb");
+  // VWAP bands: match "band #2" or "vwap" variants — only if not already matched as RSI BB
+  const vw = fe("vwap") || f("vwap");
+  const vu = f("upper band #2", "upper vwap", "vwap upper") || (!ru ? f("upper band") : null);
+  const vl = f("lower band #2", "lower vwap", "vwap lower") || (!rl ? f("lower band") : null);
   if (!cc) return null;
   const cols = { fastSMACol: fs, slowSMACol: ss, sma200Col: s2, extraSMACol: es, rsiCol: rc, rsiMACol: rm, rsiUpperBBCol: ru, rsiLowerBBCol: rl, vwapCol: vw, vwapUpperCol: vu, vwapLowerCol: vl };
   const records = parsed.data.map(row => ({ date: dc ? unixToPST(row[dc]) : "", open: parseFloat(row[oc]) || 0, high: parseFloat(row[hc]) || 0, low: parseFloat(row[lc]) || 0, close: parseFloat(row[cc]) || 0, volume: vc ? parseFloat(row[vc]) || 0 : 0, fastSMA: fs ? parseFloat(row[fs]) || null : null, slowSMA: ss ? parseFloat(row[ss]) || null : null, sma200: s2 ? parseFloat(row[s2]) || null : null, extraSMA: es ? parseFloat(row[es]) || null : null, rsi: rc ? parseFloat(row[rc]) || null : null, rsiMA: rm ? parseFloat(row[rm]) || null : null, rsiUpperBB: ru ? parseFloat(row[ru]) || null : null, rsiLowerBB: rl ? parseFloat(row[rl]) || null : null, vwap: vw ? parseFloat(row[vw]) || null : null, vwapUpperBand: vu ? parseFloat(row[vu]) || null : null, vwapLowerBand: vl ? parseFloat(row[vl]) || null : null })).filter(d => !isNaN(d.close) && d.close > 0);
@@ -1712,6 +1730,204 @@ function parseBatchFilename(name) {
   return { ticker, timeframe };
 }
 
+// ─── RSI DIVERGENCE DETECTION (simplified: BULL DIV, BEAR DIV, BLD BULL, BLD BEAR, or —) ───
+function detectDivergence(data, lookback) {
+  if (!data || data.length < 10) return { type: "none", label: "—", detail: "" };
+  const recent = data.slice(-Math.min(lookback, data.length));
+  const w = recent.filter(d => d.rsi != null && d.close > 0);
+  if (w.length < 6) return { type: "none", label: "—", detail: "" };
+
+  // Find swing pivots with 2-bar left, 1-bar right
+  const lows = [], highs = [];
+  for (let i = 2; i < w.length - 1; i++) {
+    if (w[i].low <= w[i-1].low && w[i].low <= w[i-2].low && w[i].low <= w[i+1].low)
+      lows.push({ idx: i, price: w[i].low, rsi: w[i].rsi });
+    if (w[i].high >= w[i-1].high && w[i].high >= w[i-2].high && w[i].high >= w[i+1].high)
+      highs.push({ idx: i, price: w[i].high, rsi: w[i].rsi });
+  }
+  const last = w[w.length - 1];
+  let bull = null, bear = null;
+
+  // ── STALENESS & FAILURE CHECK ──
+  const isStale = (pivotIdx, pivotPrice, type) => {
+    const recencyThreshold = Math.floor(w.length * 0.4);
+    if (pivotIdx < recencyThreshold) return true;
+    if (type === "bear" && last.close < pivotPrice * 0.97) return true;
+    if (type === "bull" && last.close > pivotPrice * 1.03) return true;
+    if (type === "bull" && last.close < pivotPrice * 0.97) return true;
+    if (type === "bear" && last.close > pivotPrice * 1.03) return true;
+    return false;
+  };
+
+  // ── BULL DIV: price lower low, RSI higher low ──
+  for (let i = lows.length - 1; i >= 1 && !bull; i--) {
+    const c = lows[i], p = lows[i-1];
+    if (c.idx - p.idx < 3) continue;
+    if (c.price < p.price * 0.998 && c.rsi > p.rsi + 1.5 && !isStale(c.idx, c.price, "bull")) {
+      // INVALIDATION: check if any later swing low (or last bar) has BOTH lower price AND lower RSI
+      // That means price and RSI dropped together past the divergence — pattern broken
+      let invalidated = false;
+      for (let j = i + 1; j < lows.length; j++) {
+        if (lows[j].price < c.price && lows[j].rsi < c.rsi - 1) { invalidated = true; break; }
+      }
+      if (!invalidated && last.low < c.price * 0.995 && last.rsi < c.rsi - 1) invalidated = true;
+      if (!invalidated)
+        bull = { sub: "regular", d: `Price $${p.price.toFixed(2)}→$${c.price.toFixed(2)} (lower low), RSI ${p.rsi.toFixed(0)}→${c.rsi.toFixed(0)} (higher low)` };
+    }
+  }
+
+  // ── BEAR DIV: price higher high, RSI lower high ──
+  for (let i = highs.length - 1; i >= 1 && !bear; i--) {
+    const c = highs[i], p = highs[i-1];
+    if (c.idx - p.idx < 3) continue;
+    if (c.price > p.price * 1.002 && c.rsi < p.rsi - 1.5 && !isStale(c.idx, c.price, "bear")) {
+      // INVALIDATION: check if any later swing high has BOTH higher price AND higher RSI
+      let invalidated = false;
+      for (let j = i + 1; j < highs.length; j++) {
+        if (highs[j].price > c.price && highs[j].rsi > c.rsi + 1) { invalidated = true; break; }
+      }
+      if (!invalidated && last.high > c.price * 1.005 && last.rsi > c.rsi + 1) invalidated = true;
+      if (!invalidated)
+        bear = { sub: "regular", d: `Price $${p.price.toFixed(2)}→$${c.price.toFixed(2)} (higher high), RSI ${p.rsi.toFixed(0)}→${c.rsi.toFixed(0)} (lower high)` };
+    }
+  }
+
+  // ── BLD BULL / BLD BEAR: 2+ confirmation points of RSI diverging from price ──
+  if (w.length >= 10) {
+    if (!bull) {
+      const recentLows = lows.filter(l => l.idx > w.length * 0.3);
+      let confirmations = 0, lastConfirm = null, firstConfirm = null;
+      for (let i = 1; i < recentLows.length; i++) {
+        const p = recentLows[i-1], c = recentLows[i];
+        if (c.idx - p.idx < 2) continue;
+        if (c.rsi > p.rsi + 1 && c.price <= p.price * 1.005) {
+          if (!firstConfirm) firstConfirm = p;
+          lastConfirm = c;
+          confirmations++;
+        }
+      }
+      if (recentLows.length >= 1) {
+        const lastLow = recentLows[recentLows.length - 1];
+        if (last.rsi > lastLow.rsi + 1 && last.low <= lastLow.price * 1.01 && w.length - 1 - lastLow.idx >= 2) {
+          if (!firstConfirm) firstConfirm = lastLow;
+          lastConfirm = { idx: w.length - 1, price: last.low, rsi: last.rsi };
+          confirmations++;
+        }
+      }
+      if (confirmations >= 2 && firstConfirm && lastConfirm) {
+        if (last.close >= lastConfirm.price * 0.97) {
+          const priceFromLow = (last.close - Math.min(...w.slice(-Math.floor(w.length * 0.6)).map(d => d.low))) / Math.min(...w.slice(-Math.floor(w.length * 0.6)).map(d => d.low));
+          if (priceFromLow < 0.05)
+            bull = { sub: "building", d: `${confirmations} confirms: RSI lows rising ${firstConfirm.rsi.toFixed(0)}→${lastConfirm.rsi.toFixed(0)} while price lows flat/lower $${firstConfirm.price.toFixed(2)}→$${lastConfirm.price.toFixed(2)}` };
+        }
+      }
+    }
+    if (!bear) {
+      const recentHighs = highs.filter(h => h.idx > w.length * 0.3);
+      let confirmations = 0, lastConfirm = null, firstConfirm = null;
+      for (let i = 1; i < recentHighs.length; i++) {
+        const p = recentHighs[i-1], c = recentHighs[i];
+        if (c.idx - p.idx < 2) continue;
+        if (c.rsi < p.rsi - 1 && c.price >= p.price * 0.995) {
+          if (!firstConfirm) firstConfirm = p;
+          lastConfirm = c;
+          confirmations++;
+        }
+      }
+      if (recentHighs.length >= 1) {
+        const lastHigh = recentHighs[recentHighs.length - 1];
+        if (last.rsi < lastHigh.rsi - 1 && last.high >= lastHigh.price * 0.99 && w.length - 1 - lastHigh.idx >= 2) {
+          if (!firstConfirm) firstConfirm = lastHigh;
+          lastConfirm = { idx: w.length - 1, price: last.high, rsi: last.rsi };
+          confirmations++;
+        }
+      }
+      if (confirmations >= 2 && firstConfirm && lastConfirm) {
+        if (last.close <= lastConfirm.price * 1.03) {
+          const priceFromHigh = (Math.max(...w.slice(-Math.floor(w.length * 0.6)).map(d => d.high)) - last.close) / last.close;
+          if (priceFromHigh < 0.05)
+            bear = { sub: "building", d: `${confirmations} confirms: RSI highs falling ${firstConfirm.rsi.toFixed(0)}→${lastConfirm.rsi.toFixed(0)} while price highs flat/higher $${firstConfirm.price.toFixed(2)}→$${lastConfirm.price.toFixed(2)}` };
+        }
+      }
+    }
+  }
+
+  // ── RSI vs RSI MA CONFLUENCE ──
+  // 1. Position: RSI above or below RSI MA
+  // 2. Crossover: RSI just crossed above/below RSI MA (last 3 bars)
+  // 3. Bounce: RSI approached RSI MA from above, held, went back up (bullish support)
+  // 4. Rejection: RSI approached RSI MA from below, failed, went back down (bearish resistance)
+  const tail = w.slice(-6);
+  const hasMa = tail.every(d => d.rsiMA != null);
+  let rsiMaSignal = "neutral"; // "bull_cross", "bear_cross", "bull_bounce", "bear_reject", "above", "below", "neutral"
+  let rsiMaNote = "";
+
+  if (hasMa && tail.length >= 4) {
+    const curr = tail[tail.length - 1], prev1 = tail[tail.length - 2], prev2 = tail[tail.length - 3], prev3 = tail[tail.length - 4];
+    const aboveNow = curr.rsi > curr.rsiMA;
+    const abovePrev1 = prev1.rsi > prev1.rsiMA;
+    const abovePrev2 = prev2.rsi > prev2.rsiMA;
+    const abovePrev3 = prev3.rsi > prev3.rsiMA;
+    const gap = curr.rsi - curr.rsiMA;
+
+    // Crossover: RSI broke above RSI MA within last 2 bars
+    if (aboveNow && (!abovePrev1 || !abovePrev2) && !abovePrev3) { rsiMaSignal = "bull_cross"; rsiMaNote = `✓ RSI crossed ABOVE RSI MA (${curr.rsi.toFixed(0)} > ${curr.rsiMA.toFixed(0)}) — bullish crossover`; }
+    // Crossover: RSI broke below RSI MA within last 2 bars
+    else if (!aboveNow && (abovePrev1 || abovePrev2) && abovePrev3) { rsiMaSignal = "bear_cross"; rsiMaNote = `⚠ RSI crossed BELOW RSI MA (${curr.rsi.toFixed(0)} < ${curr.rsiMA.toFixed(0)}) — bearish crossover`; }
+    // Bounce: RSI was above MA, dipped toward it (within 2pts), then pushed back up
+    else if (aboveNow && abovePrev2 && Math.abs(prev1.rsi - prev1.rsiMA) < 2.5 && curr.rsi > prev1.rsi + 1) { rsiMaSignal = "bull_bounce"; rsiMaNote = `✓ RSI bounced off RSI MA support (touched ${prev1.rsi.toFixed(0)} near MA ${prev1.rsiMA.toFixed(0)}, now ${curr.rsi.toFixed(0)}) — MA holding as support`; }
+    // Rejection: RSI was below MA, pushed up toward it (within 2pts), then fell back
+    else if (!aboveNow && !abovePrev2 && Math.abs(prev1.rsi - prev1.rsiMA) < 2.5 && curr.rsi < prev1.rsi - 1) { rsiMaSignal = "bear_reject"; rsiMaNote = `⚠ RSI rejected at RSI MA resistance (touched ${prev1.rsi.toFixed(0)} near MA ${prev1.rsiMA.toFixed(0)}, now ${curr.rsi.toFixed(0)}) — MA acting as ceiling`; }
+    // Sustained position
+    else if (aboveNow && abovePrev1 && abovePrev2) { rsiMaSignal = "above"; rsiMaNote = `RSI above MA (${curr.rsi.toFixed(0)} > ${curr.rsiMA.toFixed(0)}) — bullish momentum`; }
+    else if (!aboveNow && !abovePrev1 && !abovePrev2) { rsiMaSignal = "below"; rsiMaNote = `RSI below MA (${curr.rsi.toFixed(0)} < ${curr.rsiMA.toFixed(0)}) — bearish momentum`; }
+    else { rsiMaNote = `RSI ${curr.rsi.toFixed(0)} vs MA ${curr.rsiMA.toFixed(0)} — choppy`; }
+  }
+
+  // Determine if RSI MA confirms or contradicts each divergence
+  const bullishMa = ["bull_cross", "bull_bounce", "above"].includes(rsiMaSignal);
+  const bearishMa = ["bear_cross", "bear_reject", "below"].includes(rsiMaSignal);
+
+  const addConfluence = (result, isBull) => {
+    if (!result) return result;
+    const confirms = isBull ? bullishMa : bearishMa;
+    const contradicts = isBull ? bearishMa : bullishMa;
+    return { ...result, d: result.d + ` | ${rsiMaNote}`, confluence: confirms ? "confirmed" : contradicts ? "contradicted" : "neutral" };
+  };
+
+  if (bull) bull = addConfluence(bull, true);
+  if (bear) bear = addConfluence(bear, false);
+
+  // Contradicted = weakened, less grade impact
+  if (bull && bull.confluence === "contradicted") bull.weakened = true;
+  if (bear && bear.confluence === "contradicted") bear.weakened = true;
+
+  if (bull && bear) return { type: "mixed", label: "MIXED", detail: `Bull: ${bull.d} | Bear: ${bear.d}` };
+  if (bull) return { type: "bullish", label: bull.sub === "building" ? "BLD BULL" : "BULL DIV", detail: bull.d, weakened: bull.weakened };
+  if (bear) return { type: "bearish", label: bear.sub === "building" ? "BLD BEAR" : "BEAR DIV", detail: bear.d, weakened: bear.weakened };
+  return { type: "none", label: "—", detail: "" };
+}
+
+function combinedDivergence(daily, hourly) {
+  const d = daily.type, h = hourly.type;
+  // Both none
+  if (d === "none" && h === "none") return { label: "—", color: "#64748b", detail: "No divergence on either timeframe" };
+  // Both aligned
+  if (d === "bullish" && h === "bullish") return { label: "BOTH BULL", color: "#00e676", detail: "Both daily & hourly show bullish divergence — strong reversal signal UP" };
+  if (d === "bearish" && h === "bearish") return { label: "BOTH BEAR", color: "#ff1744", detail: "Both daily & hourly show bearish divergence — strong reversal signal DOWN" };
+  // Conflicting
+  if (d === "bullish" && h === "bearish") return { label: "CONFLICT", color: "#f59e0b", detail: "Daily bullish but hourly bearish — trend transition, daily bottoming while hourly still selling" };
+  if (d === "bearish" && h === "bullish") return { label: "CONFLICT", color: "#f59e0b", detail: "Daily bearish but hourly bullish — hourly bounce within daily topping pattern" };
+  // One only — clearly label which timeframe
+  if (d === "bullish" && h === "none") return { label: "DAILY ONLY", color: "#66bb6a", detail: "Daily bullish divergence — hourly not confirming yet" };
+  if (d === "bearish" && h === "none") return { label: "DAILY ONLY", color: "#ff9800", detail: "Daily bearish divergence — hourly not confirming yet" };
+  if (d === "none" && h === "bullish") return { label: "HRLY ONLY", color: "#66bb6a", detail: "Hourly bullish divergence — may lead daily if it holds" };
+  if (d === "none" && h === "bearish") return { label: "HRLY ONLY", color: "#ff9800", detail: "Hourly bearish divergence — early warning, watch if daily follows" };
+  // Mixed within a timeframe
+  if (d === "mixed" || h === "mixed") return { label: "MIXED", color: "#ffd600", detail: "Mixed signals — conflicting divergences within a timeframe" };
+  return { label: "—", color: "#64748b", detail: "" };
+}
+
 // ─── App ───
 export default function App() {
   const [ticker, setTicker] = useState(""), [dD, setDD] = useState(null), [hD, setHD] = useState(null), [dC, setDC] = useState(null), [hC, setHC] = useState(null);
@@ -1727,22 +1943,37 @@ export default function App() {
   const [earningsDates, setEarningsDates] = useState({}); // { AAPL: "Mar 5", ... }
   const [earningsLoading, setEarningsLoading] = useState(false);
   const [regimeData, setRegimeData] = useState({}); // { SPY: {...}, QQQ: {...}, IWM: {...} }
+  // ── History view (Supabase) ──
   const [viewMode, setViewMode] = useState("analysis"); // "analysis" | "history"
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyFilter, setHistoryFilter] = useState("");
+  // ── Sort & Filter for scans table ──
+  const [sortCol, setSortCol] = useState("grade"); // "grade" | "dir" | "combined"
+  const [sortAsc, setSortAsc] = useState(false);
+  const [csvText, setCsvText] = useState("");
+  const [compareCsvText, setCompareCsvText] = useState("");
+  const [filterDir, setFilterDir] = useState("ALL"); // ALL | PUTS | CALLS | WAIT
+  const [filterGrade, setFilterGrade] = useState("ALL"); // ALL | 7+ | 6+ | 5+ | <=4
+  const [filterCombined, setFilterCombined] = useState("ALL"); // ALL | BOTH BULL | BOTH BEAR | CONFLICT | HRLY ONLY | DAILY ONLY | MIXED | —
+  // ── Previous Day Comparison ──
+  const [compareMode, setCompareMode] = useState(false);
+  const [compareCsv, setCompareCsv] = useState(null); // parsed rows from downloaded CSV
+  const [compareTodayData, setCompareTodayData] = useState({}); // { AAPL: { open, close, high, low }, ... }
+  const [compareResults, setCompareResults] = useState(null); // final comparison results
+  const [compareLog, setCompareLog] = useState([]);
+  const compareCSVRef = useRef();
+  const compareBatchRef = useRef();
   const dR = useRef(), hR = useRef(), batchR = useRef();
   const rawDataRef = useRef({}); // { AAPL: { daily: records, hourly: records }, ... }
 
-  // Artifact storage cleanup (no-op in standalone mode)
+  // One-time cleanup: delete any leftover persistent storage from old versions
   useEffect(() => {
     (async () => {
       try {
-        if (window.storage?.list) {
-          const keys = await window.storage.list("scans:");
-          if (keys?.keys?.length) {
-            for (const k of keys.keys) { try { await window.storage.delete(k); } catch {} }
-          }
+        const keys = await window.storage.list("scans:");
+        if (keys?.keys?.length) {
+          for (const k of keys.keys) { try { await window.storage.delete(k); } catch {} }
         }
       } catch {}
     })();
@@ -1751,7 +1982,7 @@ export default function App() {
   // No persistent storage — scans rebuild on each batch run
 
   // Auto-save scan when analysis completes with a ticker
-  const saveScan = useCallback(async (tkr, tradeResult) => {
+  const saveScan = useCallback(async (tkr, tradeResult, dailyData, hourlyData) => {
     if (!tkr || !tradeResult) return;
     const scan = {
       ticker: tkr,
@@ -1766,9 +1997,9 @@ export default function App() {
       t4: tradeResult.targets[3]?.price?.toFixed(2) || "—",
       t5: tradeResult.targets[4]?.price?.toFixed(2) || "—",
       timestamp: new Date().toISOString(),
+      hDiv: tradeResult.hDiv, dDiv: tradeResult.dDiv, cDiv: tradeResult.cDiv, divAdj: tradeResult.divAdj,
     };
     setScans(prev => ({ ...prev, [tkr]: scan }));
-    // Save to Supabase in background
     saveResultToSupabase(scan);
     return scan;
   }, []);
@@ -1779,13 +2010,135 @@ export default function App() {
     const result = { trade: computePlan(d, h, findSR(d), findSR(h), earningsDates[tkr]?.date || earningsDates[tkr], regimeData), dSR: findSR(d), hSR: findSR(h), dPat: detectPatterns(d, "Daily"), hPat: detectPatterns(h, "Hourly"), gap: analyzeGapPot(d) };
     setAn(result); setTab("trade");
     if (tkr) {
-      saveScan(tkr, result.trade);
+      saveScan(tkr, result.trade, d, h);
       rawDataRef.current[tkr] = { daily: d, hourly: h };
     }
     return result;
   }, [ticker, saveScan, earningsDates, regimeData]);
 
   const load = useCallback((file, type) => { setErr(""); const r = new FileReader(); r.onload = e => { const res = parseCSV(e.target.result); if (!res || res.records.length < 10) { setErr(`Bad ${type} CSV`); return; } if (type === "daily") { setDD(res.records); setDC(res.cols); if (hD) run(res.records, hD); } else { setHD(res.records); setHC(res.cols); if (dD) run(dD, res.records); } }; r.readAsText(file); }, [dD, hD, run]);
+
+  // ── PREVIOUS DAY COMPARISON ──
+  const handleCompareCSV = useCallback((file) => {
+    const r = new FileReader();
+    r.onload = e => {
+      const parsed = Papa.parse(e.target.result.trim(), { header: true, skipEmptyLines: true });
+      if (!parsed.data?.length) { setCompareLog(["❌ Could not parse CSV"]); return; }
+      setCompareCsv(parsed.data);
+      setCompareLog([`✅ Loaded ${parsed.data.length} tickers from previous day CSV`]);
+    };
+    r.readAsText(file);
+  }, []);
+
+  const handleCompareBatch = useCallback(async (files) => {
+    if (!compareCsv || !compareCsv.length) { setCompareLog(prev => [...prev, "❌ Upload previous day CSV first"]); return; }
+    const log = [`📂 ${files.length} files dropped for today's data`];
+    setCompareLog(prev => [...prev, ...log]);
+    const todayData = {};
+    const fileArr = Array.from(files);
+    let matched = 0, skipped = 0;
+    for (const file of fileArr) {
+      const info = parseBatchFilename(file.name);
+      if (!info) { skipped++; continue; }
+      const text = await file.text();
+      const parsed = Papa.parse(text.trim(), { header: true, skipEmptyLines: true });
+      if (!parsed.data?.length) { skipped++; continue; }
+      const headers = parsed.meta.fields.map(f => f.toLowerCase().trim());
+      const oIdx = headers.findIndex(h => h === "open");
+      const cIdx = headers.findIndex(h => h === "close");
+      const hIdx = headers.findIndex(h => h === "high");
+      const lIdx = headers.findIndex(h => h === "low");
+      const lastRow = parsed.data[parsed.data.length - 1];
+      const vals = Object.values(lastRow);
+      const open = parseFloat(oIdx >= 0 ? vals[oIdx] : lastRow.open || lastRow.Open);
+      const close = parseFloat(cIdx >= 0 ? vals[cIdx] : lastRow.close || lastRow.Close);
+      const high = parseFloat(hIdx >= 0 ? vals[hIdx] : lastRow.high || lastRow.High);
+      const low = parseFloat(lIdx >= 0 ? vals[lIdx] : lastRow.low || lastRow.Low);
+      if (isNaN(open)) { skipped++; continue; }
+      const tkr = info.ticker;
+      // For daily: use as primary source. For hourly: aggregate high/low across all bars, use latest close
+      if (!todayData[tkr]) {
+        todayData[tkr] = { open, close: isNaN(close) ? open : close, high: isNaN(high) ? open : high, low: isNaN(low) ? open : low };
+      } else {
+        // Merge: expand high/low range, prefer daily close if available
+        const existing = todayData[tkr];
+        if (!isNaN(high) && high > existing.high) existing.high = high;
+        if (!isNaN(low) && low < existing.low) existing.low = low;
+        // For hourly files, scan ALL bars to get true intraday high/low
+        if (info.timeframe === "hourly") {
+          for (const row of parsed.data) {
+            const rv = Object.values(row);
+            const rh = parseFloat(hIdx >= 0 ? rv[hIdx] : row.high || row.High);
+            const rl = parseFloat(lIdx >= 0 ? rv[lIdx] : row.low || row.Low);
+            if (!isNaN(rh) && rh > existing.high) existing.high = rh;
+            if (!isNaN(rl) && rl < existing.low) existing.low = rl;
+          }
+          // Use hourly latest close as the most recent price
+          const hClose = parseFloat(cIdx >= 0 ? vals[cIdx] : lastRow.close || lastRow.Close);
+          if (!isNaN(hClose)) existing.close = hClose;
+        }
+        if (info.timeframe === "daily" && !isNaN(close)) existing.close = close;
+      }
+      matched++;
+      log.push(`✅ ${tkr} (${info.timeframe}): ${info.timeframe === "daily" ? "open $" + open.toFixed(2) + " close $" + (isNaN(close) ? "—" : close.toFixed(2)) : "hourly H/L merged"}`);
+    }
+    if (skipped > 0) log.push(`⚠ ${skipped} files skipped (unrecognized naming)`);
+    log.push(`── ${matched} files matched across ${Object.keys(todayData).length} tickers ──`);
+    setCompareLog(prev => [...prev, ...log]);
+    setCompareTodayData(todayData);
+
+    // Now compare
+    const results = [];
+    for (const row of compareCsv) {
+      const tkr = (row.Ticker || row.ticker || "").trim().toUpperCase();
+      if (!tkr) continue;
+      const prevDir = (row.Dir || row.dir || row.Direction || "").trim().toUpperCase();
+      const prevGrade = parseInt(row.Grade || row.grade || row.GRD || "0");
+      const prevPrice = parseFloat((row.Price || row.price || "0").replace("$", ""));
+      const t1 = row.T1 || row.t1 || "—";
+      const t2 = row.T2 || row.t2 || "—";
+      const t3 = row.T3 || row.t3 || "—";
+      const today = todayData[tkr];
+      if (!today) { results.push({ tkr, prevDir, prevGrade, prevPrice, todayOpen: null, move: null, correct: null, note: "No today data" }); continue; }
+      const todayOpen = today.open;
+      const todayClose = today.close;
+      const todayHigh = today.high;
+      const todayLow = today.low;
+      const movePct = ((todayClose - prevPrice) / prevPrice * 100).toFixed(2);
+      const openMovePct = ((todayOpen - prevPrice) / prevPrice * 100).toFixed(2);
+      let correct = null;
+      let note = "";
+      if (prevDir === "PUTS") {
+        // Check if price moved down from prev price
+        const hitT1 = t1 !== "—" && todayLow <= parseFloat(t1);
+        if (todayClose < prevPrice) { correct = true; note = `Dropped ${Math.abs(movePct)}%${hitT1 ? " ✓ Hit T1" : ""}`; }
+        else if (todayLow < prevPrice && todayClose >= prevPrice) { correct = "partial"; note = `Intraday low hit but closed up ${movePct}%`; }
+        else { correct = false; note = `Rose ${movePct}%`; }
+      } else if (prevDir === "CALLS") {
+        const hitT1 = t1 !== "—" && todayHigh >= parseFloat(t1);
+        if (todayClose > prevPrice) { correct = true; note = `Gained ${movePct}%${hitT1 ? " ✓ Hit T1" : ""}`; }
+        else if (todayHigh > prevPrice && todayClose <= prevPrice) { correct = "partial"; note = `Intraday high hit but closed down ${movePct}%`; }
+        else { correct = false; note = `Dropped ${Math.abs(movePct)}%`; }
+      } else {
+        correct = null; note = `WAIT — no direction. Moved ${movePct}%`;
+      }
+      results.push({ tkr, prevDir, prevGrade, prevPrice, todayOpen, todayClose, todayHigh, todayLow, movePct, openMovePct, correct, note, t1, t2, t3 });
+    }
+    // Sort: correct first, then partial, then wrong, then no data
+    results.sort((a, b) => {
+      const order = v => v === true ? 0 : v === "partial" ? 1 : v === false ? 2 : 3;
+      return order(a.correct) - order(b.correct);
+    });
+    setCompareResults(results);
+    const wins = results.filter(r => r.correct === true).length;
+    const partials = results.filter(r => r.correct === "partial").length;
+    const losses = results.filter(r => r.correct === false).length;
+    const noData = results.filter(r => r.correct === null).length;
+    log.push(`\n── RESULTS: ✅ ${wins} correct, 🟡 ${partials} partial, ❌ ${losses} wrong, ⏸ ${noData} no data ──`);
+    log.push(`Win rate: ${results.length > 0 ? ((wins / (wins + losses + partials)) * 100).toFixed(1) : 0}% (${wins}/${wins + losses + partials})`);
+    setCompareLog(prev => [...prev, ...log]);
+  }, [compareCsv]);
+
 
   // ── BATCH MODE ──
   const processBatchFiles = useCallback(async (files) => {
@@ -1866,6 +2219,7 @@ export default function App() {
           t1: trade.targets[0]?.price?.toFixed(2) || "—", t2: trade.targets[1]?.price?.toFixed(2) || "—",
           t3: trade.targets[2]?.price?.toFixed(2) || "—", t4: trade.targets[3]?.price?.toFixed(2) || "—",
           t5: trade.targets[4]?.price?.toFixed(2) || "—", timestamp: new Date().toISOString(),
+          hDiv: trade.hDiv, dDiv: trade.dDiv, cDiv: trade.cDiv, divAdj: trade.divAdj,
         };
         setScans(prev => ({ ...prev, [tkr]: scan }));
         rawDataRef.current[tkr] = { daily: p.daily, hourly: p.hourly };
@@ -1923,64 +2277,46 @@ export default function App() {
   const fetchAI = async () => {
     if (!an) return; setAIL(true); setAI("");
     const t = an.trade;
-    const tgts = t.targets.map((x, i) => `T${i + 1}: $${x.price.toFixed(2)} (${x.label})`).join("\n");
-    const gapInfo = t.gapCtx?.activeGapFill ? `ACTIVE GAP FILL: ${t.gapCtx.activeGapFill.type} from ${t.gapCtx.activeGapFill.prevDate}→${t.gapCtx.activeGapFill.date}, range $${t.gapCtx.activeGapFill.gapBottom.toFixed(2)}-$${t.gapCtx.activeGapFill.gapTop.toFixed(2)}` : "No active gap fill";
-    const t1 = t.targets[0], t2 = t.targets[1], t3 = t.targets[2];
-    const safeguardInfo = [
-      t.extremeWarning ? `SAFEGUARD WARNING: ${t.extremeWarning.type} — ${t.extremeWarning.severity} severity. Grade penalized by ${t.extremeWarning.gradeAdj}.` : "",
-      t.earningsAdj ? `EARNINGS: ${t.earningsAdj.daysUntil} days until earnings. Effect: ${t.earningsAdj.effect}.` : "",
-      t.rsiCap ? `RSI CAP: Grade capped at 7 from ${t.rsiCap.cappedFrom} due to RSI extreme.` : "",
-      t.reversalInfo?.isReversal ? `REVERSAL DETECTED: Hourly leading daily with ${t.reversalInfo.signals.length} signals (score ${t.reversalInfo.score}). ${t.reversalInfo.signals.map(s => s.text.split("—")[0].trim()).join(", ")}. This is an early reversal setup — daily hasn't confirmed yet.` : "",
-    ].filter(Boolean).join("\n");
-    const regimeInfo = Object.entries(regimeData).map(([k, v]) => `${k}: ${v.direction} (score ${v.score}, 5d ${v.pct5d}%, RSI ${v.rsi})`).join(", ");
-    const volInfo = t.daily.volume?.hasVolume ? `Daily RelVol: ${t.daily.volume.relVol}x, Trend: ${t.daily.volume.trend}, Confirmation: ${t.daily.volume.confirmation}${t.daily.volume.climax ? " ⚠CLIMAX" : ""}` : "No volume data";
-    const catInfo = t.categories ? `SCORING: Trend ${t.categories.trend}/3, Entry ${t.categories.entry}/5, Confirm ${t.categories.confirm}/3${t.categories.late > 0 ? `, LATE PENALTY -${t.categories.late}` : ""}, Align +${t.categories.align}` : "";
-    const prompt = `Elite stock analyst. ${ticker || "Stock"} instant trade.
-DAILY: ${t.daily.dir} score ${t.daily.score} (gap adj: ${t.gapCtx.gapFillAdj}), RSI ${t.daily.rsi}
-HOURLY: ${t.hourly.dir} score ${t.hourly.score}, RSI ${t.hourly.rsi}${t.hourly.vwap ? `, VWAP $${t.hourly.vwap}` : ""}
-${catInfo}
-GAP: ${gapInfo}
-VOLUME: ${volInfo}
-MARKET REGIME: ${regimeInfo || "No benchmark data available"}
-${safeguardInfo ? `SAFEGUARDS:\n${safeguardInfo}` : ""}
-DECISION: ${t.direction} Grade ${t.grade}/10
-Current price: $${t.price}
-5 TARGETS:\n${tgts}
+    const tgts = t.targets.slice(0, 3).map((x, i) => `T${i + 1}: $${x.price.toFixed(2)} (${x.pct}%) — ${x.label}`).join("\n");
+    const gapInfo = t.gapCtx?.activeGapFill ? `ACTIVE GAP FILL: ${t.gapCtx.activeGapFill.type} $${t.gapCtx.activeGapFill.gapBottom.toFixed(2)}-$${t.gapCtx.activeGapFill.gapTop.toFixed(2)}` : "No active gap fill";
+    const divInfo = t.divAdj ? `DIV CONFLICT: ${t.divAdj.gradeAdj} — divergence opposes direction` : t.cDiv?.label !== "—" ? `DIVERGENCE: H:${t.hDiv?.label || "—"} D:${t.dDiv?.label || "—"} Combined:${t.cDiv?.label}` : "";
+    const safeguards = [
+      t.extremeWarning ? `${t.extremeWarning.type} (${t.extremeWarning.severity})` : "",
+      t.earningsAdj ? `Earnings ${t.earningsAdj.daysUntil}d (${t.earningsAdj.effect})` : "",
+      t.rsiCap ? `Grade capped from ${t.rsiCap.cappedFrom}` : "",
+      t.reversalInfo?.isReversal ? `Reversal: ${t.reversalInfo.signals.length} signals` : "",
+    ].filter(Boolean).join(", ");
+    const prompt = `${ticker} swing trade analysis (1-2 week hold).
+Price: $${t.price} | ${t.direction} Grade ${t.grade}/10 | Daily RSI ${t.daily.rsi} | Hourly RSI ${t.hourly.rsi}
+Daily: ${t.daily.dir} (score ${t.daily.score}) | Hourly: ${t.hourly.dir} (score ${t.hourly.score})
+Gap: ${gapInfo} | Vol: ${t.daily.volume?.hasVolume ? `${t.daily.volume.relVol}x ${t.daily.volume.confirmation}` : "N/A"}
+${divInfo ? `${divInfo}\n` : ""}${safeguards ? `Safeguards: ${safeguards}\n` : ""}Targets:\n${tgts}
 
-Search latest news on ${ticker} from these sources: sherwoodnews.com, Reuters, Bloomberg, MarketWatch. Look for: tariffs, catalysts, gaps, earnings, analyst upgrades/downgrades, sector momentum.
+Respond in this EXACT format — be concise, 1-2 sentences per section:
 
-You MUST follow this EXACT format with ALL 6 sections. Do not skip any section.
-
-1. **TAKE TRADE NOW?**
-Consider gap fill context, current price action, and momentum.
-
-2. **GAP ANALYSIS**
-Is this just a gap fill or a trend reversal?
-
-3. **NEWS & CATALYSTS**
-Recent news, earnings, tariffs, sector momentum.
-
+1. **TAKE TRADE NOW?** Yes/No + reason considering momentum & gaps
+2. **GAP ANALYSIS** Gap fill vs trend reversal assessment
+3. **NEWS & CATALYSTS** Key recent drivers (tariffs, earnings, upgrades, sector)
 4. **TARGET PROBABILITIES (1 WEEK)**
-You MUST analyze each of these 3 targets individually. For EACH target, give a probability percentage and a 1-line reason. Use this exact format:
+T1 $${t.targets[0]?.price.toFixed(2) || "—"}: XX% — reason
+T2 $${t.targets[1]?.price.toFixed(2) || "—"}: XX% — reason
+T3 $${t.targets[2]?.price.toFixed(2) || "—"}: XX% — reason
+5. **RISKS** Top 2-3 risks
+6. **FINAL VERDICT** One line: direction, best target, confidence`;
 
-**T1: $${t1 ? t1.price.toFixed(2) : "—"}**
-- XX% Probability
-- (reason based on distance, S/R, momentum, and news)
-
-**T2: $${t2 ? t2.price.toFixed(2) : "—"}**
-- XX% Probability
-- (reason)
-
-**T3: $${t3 ? t3.price.toFixed(2) : "—"}**
-- XX% Probability
-- (reason)
-
-5. **RISKS**
-Key risks that could invalidate the trade.
-
-6. **FINAL VERDICT**
-One-line summary: direction, best target, and confidence.`;
-    try { const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-5-20250929", max_tokens: 1500, tools: [{ type: "web_search_20250305", name: "web_search" }], messages: [{ role: "user", content: prompt }] }) }); const d = await r.json(); setAI(d.content?.map(i => i.text || "").filter(Boolean).join("\n") || "No response."); } catch (e) { setAI("Error: " + e.message); }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000,
+          tools: [{ type: "web_search_20250305", name: "web_search" }],
+          messages: [{ role: "user", content: prompt }] })
+      });
+      clearTimeout(timeout);
+      const d = await r.json();
+      setAI(d.content?.map(i => i.text || "").filter(Boolean).join("\n") || "No response.");
+    } catch (e) { clearTimeout(timeout); setAI(e.name === "AbortError" ? "⏱ Timed out (30s). Try again." : "Error: " + e.message); }
     setAIL(false);
   };
 
@@ -2014,65 +2350,33 @@ One-line summary: direction, best target, and confidence.`;
         t.extremeWarning ? `SAFEGUARD WARNING: ${t.extremeWarning.type} — ${t.extremeWarning.severity} severity. Grade penalized by ${t.extremeWarning.gradeAdj}.` : "",
         t.earningsAdj ? `EARNINGS: ${t.earningsAdj.daysUntil} days until earnings. Effect: ${t.earningsAdj.effect}.` : "",
         t.rsiCap ? `RSI CAP: Grade capped at 7 from ${t.rsiCap.cappedFrom} due to RSI extreme.` : "",
-        t.regimeAdj ? `REGIME: ${t.regimeAdj.effect} (${t.regimeAdj.gradeAdj > 0 ? "+" : ""}${t.regimeAdj.gradeAdj}).` : "",
         t.reversalInfo?.isReversal ? `REVERSAL: Hourly leading daily, ${t.reversalInfo.signals.length} signals (score ${t.reversalInfo.score}). Early reversal — daily not confirmed.` : "",
       ].filter(Boolean).join("\n");
 
-      const batchRegimeInfo = Object.entries(regimeData).map(([k, v]) => `${k}: ${v.direction} (5d ${v.pct5d}%)`).join(", ");
-      const batchVolInfo = t.daily.volume?.hasVolume ? `RelVol ${t.daily.volume.relVol}x, ${t.daily.volume.trend}, ${t.daily.volume.confirmation}${t.daily.volume.climax ? " CLIMAX" : ""}` : "No vol";
-      const batchCatInfo = t.categories ? `SCORING: T:${t.categories.trend}/3 E:${t.categories.entry}/5 C:${t.categories.confirm}/3${t.categories.late > 0 ? ` LATE:-${t.categories.late}` : ""}` : "";
-      const prompt = `Elite stock analyst. ${tkr} instant trade.
-DAILY: ${t.daily.dir} score ${t.daily.score} (gap adj: ${t.gapCtx.gapFillAdj}), RSI ${t.daily.rsi}
-HOURLY: ${t.hourly.dir} score ${t.hourly.score}, RSI ${t.hourly.rsi}${t.hourly.vwap ? `, VWAP $${t.hourly.vwap}` : ""}
-${batchCatInfo}
-GAP: ${gapInfo}
-VOLUME: ${batchVolInfo}
-MARKET REGIME: ${batchRegimeInfo || "N/A"}
-${safeguardInfo ? `SAFEGUARDS:\n${safeguardInfo}` : ""}
-DECISION: ${t.direction} Grade ${t.grade}/10
-Current price: $${t.price}
-5 TARGETS:\n${tgts}
+      const batchVolInfo = t.daily.volume?.hasVolume ? `${t.daily.volume.relVol}x ${t.daily.volume.confirmation}` : "No vol";
+      const divInfo = t.divAdj ? `DIV CONFLICT: ${t.divAdj.gradeAdj}` : t.cDiv?.label !== "—" ? `DIV: ${t.cDiv?.label}` : "";
+      const prompt = `${tkr} swing trade (1-2wk). $${t.price} | ${t.direction} G${t.grade} | D:${t.daily.dir} RSI${t.daily.rsi} H:${t.hourly.dir} RSI${t.hourly.rsi}
+Gap:${gapInfo} Vol:${batchVolInfo}${divInfo ? ` ${divInfo}` : ""}
+${safeguardInfo ? safeguardInfo + "\n" : ""}Targets: ${tgts}
 
-Search latest news on ${tkr} from these sources: sherwoodnews.com, Reuters, Bloomberg, MarketWatch. Look for: tariffs, catalysts, gaps, earnings, analyst upgrades/downgrades, sector momentum.
+Concise (1-2 sentences each):
+1.**TRADE NOW?** 2.**GAP** 3.**NEWS** 4.**T1$${t1?.price.toFixed(2)||"—"}:XX% T2$${t2?.price.toFixed(2)||"—"}:XX% T3$${t3?.price.toFixed(2)||"—"}:XX%** 5.**RISKS** 6.**VERDICT**`;
 
-You MUST follow this EXACT format with ALL 6 sections. Do not skip any section.
-
-1. **TAKE TRADE NOW?**
-Consider gap fill context, current price action, and momentum.
-
-2. **GAP ANALYSIS**
-Is this just a gap fill or a trend reversal?
-
-3. **NEWS & CATALYSTS**
-Recent news, earnings, tariffs, sector momentum.
-
-4. **TARGET PROBABILITIES (1 WEEK)**
-You MUST analyze each of these 3 targets individually. For EACH target, give a probability percentage and a 1-line reason. Use this exact format:
-
-**T1: $${t1 ? t1.price.toFixed(2) : "—"}**
-- XX% Probability
-- (reason based on distance, S/R, momentum, and news)
-
-**T2: $${t2 ? t2.price.toFixed(2) : "—"}**
-- XX% Probability
-- (reason)
-
-**T3: $${t3 ? t3.price.toFixed(2) : "—"}**
-- XX% Probability
-- (reason)
-
-5. **RISKS**
-Key risks that could invalidate the trade.
-
-6. **FINAL VERDICT**
-One-line summary: direction, best target, and confidence.`;
-
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
       try {
-        const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-5-20250929", max_tokens: 1500, tools: [{ type: "web_search_20250305", name: "web_search" }], messages: [{ role: "user", content: prompt }] }) });
+        const r = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+          body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 800,
+            tools: [{ type: "web_search_20250305", name: "web_search" }],
+            messages: [{ role: "user", content: prompt }] })
+        });
+        clearTimeout(timeout);
         const d = await r.json();
         results[tkr] = d.content?.map(i => i.text || "").filter(Boolean).join("\n") || "No response.";
       } catch (e) {
-        results[tkr] = "Error: " + e.message;
+        clearTimeout(timeout);
+        results[tkr] = e.name === "AbortError" ? "⏱ Timed out (30s)" : "Error: " + e.message;
       }
       setBatchAIResults({ ...results });
     }
@@ -2118,7 +2422,7 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
       const r = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-5-20250929", max_tokens: 3000,
+          model: "claude-sonnet-4-20250514", max_tokens: 3000,
           tools: [{ type: "web_search_20250305", name: "web_search" }],
           messages: [{ role: "user", content: prompt }]
         })
@@ -2192,53 +2496,55 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
         <div style={{ flex: 1 }} />
         <input type="text" placeholder="TICKER" value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())} style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 5, padding: "4px 8px", color: "#00e676", fontFamily: "inherit", fontSize: 12, fontWeight: 700, width: 80, textAlign: "center", outline: "none" }} />
         {Object.keys(scans).length > 0 && <div style={{ background: "#7c3aed22", border: "1px solid #7c3aed44", borderRadius: 5, padding: "3px 8px", fontSize: 9, color: "#a78bfa", fontWeight: 700 }}>{Object.keys(scans).length} scans</div>}
-        <button onClick={() => { setViewMode("analysis"); setBatchMode(!batchMode); }} style={{ background: batchMode && viewMode === "analysis" ? "#f59e0b22" : "transparent", border: `1px solid ${batchMode && viewMode === "analysis" ? "#f59e0b" : "#1e293b"}`, borderRadius: 5, padding: "4px 8px", color: batchMode && viewMode === "analysis" ? "#f59e0b" : "#64748b", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>{batchMode ? "⚡ SINGLE" : "📦 BATCH"}</button>
+        <button onClick={() => { setBatchMode(!batchMode); setViewMode("analysis"); }} style={{ background: batchMode && viewMode === "analysis" ? "#f59e0b22" : "transparent", border: `1px solid ${batchMode && viewMode === "analysis" ? "#f59e0b" : "#1e293b"}`, borderRadius: 5, padding: "4px 8px", color: batchMode && viewMode === "analysis" ? "#f59e0b" : "#64748b", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>{batchMode ? "⚡ SINGLE" : "📦 BATCH"}</button>
         <button onClick={async () => { if (viewMode === "history") { setViewMode("analysis"); } else { setViewMode("history"); setHistoryLoading(true); const data = await fetchHistoryFromSupabase(); setHistory(data); setHistoryLoading(false); }}} style={{ background: viewMode === "history" ? "#7c3aed22" : "transparent", border: `1px solid ${viewMode === "history" ? "#7c3aed" : "#1e293b"}`, borderRadius: 5, padding: "4px 8px", color: viewMode === "history" ? "#a78bfa" : "#64748b", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>📜 HISTORY</button>
       </div>
 
-      <div style={{ padding: "10px 14px", maxWidth: 920, margin: "0 auto" }}>
-
-        {/* ── HISTORY VIEW ── */}
-        {viewMode === "history" && (
-          <div style={{ marginBottom: 10 }}>
-            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
-              <input type="text" placeholder="Filter by ticker..." value={historyFilter} onChange={e => setHistoryFilter(e.target.value.toUpperCase())} style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 5, padding: "4px 8px", color: "#a78bfa", fontFamily: "inherit", fontSize: 11, fontWeight: 700, width: 140, outline: "none" }} />
-              <div style={{ fontSize: 9, color: "#64748b" }}>{history.length} records</div>
-              <div style={{ flex: 1 }} />
-              <button onClick={async () => { setHistoryLoading(true); const data = await fetchHistoryFromSupabase(); setHistory(data); setHistoryLoading(false); }} style={{ background: "transparent", border: "1px solid #1e293b", borderRadius: 5, padding: "3px 8px", color: "#64748b", fontFamily: "inherit", fontSize: 9, cursor: "pointer" }}>↻ Refresh</button>
-            </div>
-            {historyLoading && <div style={{ textAlign: "center", padding: 20, color: "#a78bfa", fontSize: 11, fontWeight: 700 }}>Loading history...</div>}
-            {!historyLoading && history.length === 0 && <div style={{ textAlign: "center", padding: 20, color: "#64748b", fontSize: 11 }}>No history yet. Run analyses to populate.</div>}
-            {!historyLoading && history.filter(h => !historyFilter || h.ticker?.includes(historyFilter)).length > 0 && (
-              <div style={{ border: "1px solid #1e293b", borderRadius: 8, overflow: "hidden" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "60px 40px 50px 60px 60px 60px 60px 60px 60px 1fr", gap: 0, background: "#111827", padding: "6px 8px", fontSize: 8, fontWeight: 800, color: "#64748b", textTransform: "uppercase", letterSpacing: 0.5 }}>
-                  <div>Ticker</div><div>Grade</div><div>Dir</div><div>Price</div><div>T1</div><div>T2</div><div>T3</div><div>T4</div><div>T5</div><div>Date</div>
-                </div>
-                {history.filter(h => !historyFilter || h.ticker?.includes(historyFilter)).map((h, i) => {
-                  const gradeColor = h.grade >= 8 ? "#00e676" : h.grade >= 6 ? "#ffd600" : h.grade >= 4 ? "#ff9100" : "#ff1744";
-                  const dirColor = h.direction === "CALLS" ? "#00e676" : h.direction === "PUTS" ? "#ff1744" : "#ffd600";
-                  return (
-                    <div key={h.id || i} style={{ display: "grid", gridTemplateColumns: "60px 40px 50px 60px 60px 60px 60px 60px 60px 1fr", gap: 0, padding: "5px 8px", fontSize: 10, borderTop: "1px solid #1e293b11", background: i % 2 === 0 ? "rgba(17,24,39,0.3)" : "transparent" }}>
-                      <div style={{ color: "#e2e8f0", fontWeight: 700 }}>{h.ticker}</div>
-                      <div style={{ color: gradeColor, fontWeight: 800 }}>{h.grade}/10</div>
-                      <div style={{ color: dirColor, fontWeight: 700, fontSize: 9 }}>{h.direction}</div>
-                      <div style={{ color: "#94a3b8" }}>${parseFloat(h.price || 0).toFixed(2)}</div>
-                      <div style={{ color: "#64748b" }}>{h.target_1 || "—"}</div>
-                      <div style={{ color: "#64748b" }}>{h.target_2 || "—"}</div>
-                      <div style={{ color: "#64748b" }}>{h.target_3 || "—"}</div>
-                      <div style={{ color: "#64748b" }}>{h.target_4 || "—"}</div>
-                      <div style={{ color: "#64748b" }}>{h.target_5 || "—"}</div>
-                      <div style={{ color: "#475569", fontSize: 9 }}>{h.analyzed_at ? new Date(h.analyzed_at).toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—"}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+      {/* ── HISTORY VIEW ── */}
+      {viewMode === "history" && (
+        <div style={{ padding: "10px 14px", maxWidth: 920, margin: "0 auto" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <input type="text" placeholder="Filter by ticker..." value={historyFilter} onChange={e => setHistoryFilter(e.target.value.toUpperCase())} style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 5, padding: "4px 8px", color: "#a78bfa", fontFamily: "inherit", fontSize: 11, fontWeight: 700, width: 140, outline: "none" }} />
+            <span style={{ fontSize: 9, color: "#64748b" }}>{history.length} records</span>
+            <div style={{ flex: 1 }} />
+            <button onClick={async () => { setHistoryLoading(true); const data = await fetchHistoryFromSupabase(); setHistory(data); setHistoryLoading(false); }} style={{ background: "transparent", border: "1px solid #1e293b", borderRadius: 5, padding: "3px 8px", color: "#64748b", fontFamily: "inherit", fontSize: 9, cursor: "pointer" }}>↻ Refresh</button>
           </div>
-        )}
+          {historyLoading && <div style={{ textAlign: "center", padding: 20, color: "#a78bfa", fontSize: 11, fontWeight: 700 }}>Loading history...</div>}
+          {!historyLoading && history.length === 0 && <div style={{ textAlign: "center", padding: 20, color: "#64748b", fontSize: 11 }}>No history yet. Run analyses to populate.</div>}
+          {!historyLoading && history.filter(h => !historyFilter || h.ticker?.includes(historyFilter)).length > 0 && (
+            <div style={{ border: "1px solid #1e293b", borderRadius: 5, overflow: "hidden" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "60px 40px 50px 60px 60px 60px 60px 60px 60px 60px 60px 70px 1fr", padding: "4px 6px", background: "#111827", borderBottom: "1px solid #1e293b" }}>
+                {["Ticker", "Grade", "Dir", "Price", "T1", "T2", "T3", "T4", "T5", "H Div", "D Div", "Combined", "Date"].map(h => <div key={h} style={{ fontSize: 7, fontWeight: 700, color: h.includes("Div") || h === "Combined" ? "#a78bfa" : "#64748b", textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</div>)}
+              </div>
+              {history.filter(h => !historyFilter || h.ticker?.includes(historyFilter)).map((h, i) => {
+                const dc = h.direction === "CALLS" ? "#00e676" : h.direction === "PUTS" ? "#ff1744" : "#ffd600";
+                return (
+                  <div key={i} style={{ display: "grid", gridTemplateColumns: "60px 40px 50px 60px 60px 60px 60px 60px 60px 60px 60px 70px 1fr", padding: "3px 6px", borderBottom: "1px solid #1e293b11", fontSize: 9 }}>
+                    <div style={{ fontWeight: 700, color: "#e2e8f0" }}>{h.ticker}</div>
+                    <div style={{ fontWeight: 700, color: h.grade >= 7 ? "#00e676" : h.grade >= 5 ? "#ffd600" : "#ff1744" }}>{h.grade}</div>
+                    <div style={{ fontWeight: 700, color: dc }}>{h.is_reversal ? "🔄" : ""}{h.direction === "CALLS" ? "📈" : h.direction === "PUTS" ? "📉" : "⏸"}</div>
+                    <div style={{ color: "#94a3b8" }}>${h.price}</div>
+                    <div style={{ color: "#94a3b8" }}>{h.target_1 || "—"}</div>
+                    <div style={{ color: "#94a3b8" }}>{h.target_2 || "—"}</div>
+                    <div style={{ color: "#94a3b8" }}>{h.target_3 || "—"}</div>
+                    <div style={{ color: "#94a3b8" }}>{h.target_4 || "—"}</div>
+                    <div style={{ color: "#94a3b8" }}>{h.target_5 || "—"}</div>
+                    <div style={{ fontWeight: 700, color: h.h_div && h.h_div !== "—" ? "#a78bfa" : "#64748b", fontSize: 7 }}>{h.h_div || "—"}</div>
+                    <div style={{ fontWeight: 700, color: h.d_div && h.d_div !== "—" ? "#a78bfa" : "#64748b", fontSize: 7 }}>{h.d_div || "—"}</div>
+                    <div style={{ fontWeight: 700, color: h.combined_div && h.combined_div !== "—" ? "#a78bfa" : "#64748b", fontSize: 7 }}>{h.combined_div || "—"}</div>
+                    <div style={{ color: "#475569", fontSize: 7 }}>{new Date(h.analyzed_at).toLocaleDateString()}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {viewMode === "analysis" && <div style={{ padding: "10px 14px", maxWidth: 920, margin: "0 auto" }}>
 
         {/* ── BATCH MODE ── */}
-        {viewMode === "analysis" && batchMode && (<div style={{ marginBottom: 10 }}>
+        {batchMode && (<div style={{ marginBottom: 10 }}>
           <div
             onClick={() => batchR.current?.click()}
             onDragOver={e => { e.preventDefault(); e.stopPropagation(); }}
@@ -2262,6 +2568,110 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
           )}
         </div>)}
 
+        {/* ── PREVIOUS DAY COMPARISON ── */}
+        {batchMode && (
+          <div style={{ marginBottom: 10 }}>
+            <div onClick={() => setCompareMode(!compareMode)} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", padding: "8px 12px", background: compareMode ? "rgba(124,58,237,0.08)" : "rgba(17,24,39,0.5)", border: `1px solid ${compareMode ? "#7c3aed44" : "#1e293b"}`, borderRadius: 8, marginBottom: compareMode ? 8 : 0 }}>
+              <span style={{ fontSize: 14 }}>📊</span>
+              <span style={{ fontSize: 11, fontWeight: 700, color: compareMode ? "#a78bfa" : "#64748b" }}>PREVIOUS DAY COMPARISON</span>
+              <span style={{ fontSize: 9, color: "#64748b", marginLeft: 4 }}>— Was the bot right or wrong?</span>
+              <span style={{ marginLeft: "auto", fontSize: 10, color: "#64748b" }}>{compareMode ? "▲" : "▼"}</span>
+            </div>
+            {compareMode && (
+              <div style={{ background: "rgba(17,24,39,0.8)", border: "1px solid #7c3aed33", borderRadius: 8, padding: "14px 16px" }}>
+                <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+                  {/* Step 1: Upload previous day CSV */}
+                  <div onClick={() => compareCSVRef.current?.click()} style={{ flex: 1, border: `2px dashed ${compareCsv ? "#a78bfa" : "#1e293b"}`, borderRadius: 10, padding: "14px 10px", textAlign: "center", cursor: "pointer", background: compareCsv ? "#7c3aed08" : "rgba(17,24,39,0.5)" }}>
+                    <div style={{ fontSize: 14 }}>{compareCsv ? "✅" : "1️⃣"}</div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: compareCsv ? "#a78bfa" : "#e2e8f0" }}>Previous Day CSV</div>
+                    <div style={{ fontSize: 8, color: "#64748b" }}>{compareCsv ? `${compareCsv.length} tickers loaded` : "Downloaded scans CSV"}</div>
+                    <input ref={compareCSVRef} type="file" accept=".csv" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) handleCompareCSV(e.target.files[0]); }} />
+                  </div>
+                  {/* Step 2: Upload today's daily CSVs */}
+                  <div
+                    onClick={() => compareBatchRef.current?.click()}
+                    onDragOver={e => { e.preventDefault(); e.stopPropagation(); }}
+                    onDrop={e => { e.preventDefault(); e.stopPropagation(); if (e.dataTransfer.files.length) handleCompareBatch(e.dataTransfer.files); }}
+                    style={{ flex: 1, border: `2px dashed ${compareResults ? "#00e676" : "#1e293b"}`, borderRadius: 10, padding: "14px 10px", textAlign: "center", cursor: "pointer", background: compareResults ? "#00e67608" : "rgba(17,24,39,0.5)" }}>
+                    <div style={{ fontSize: 14 }}>{compareResults ? "✅" : "2️⃣"}</div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: compareResults ? "#00e676" : "#e2e8f0" }}>Today's CSVs</div>
+                    <div style={{ fontSize: 8, color: "#64748b" }}>{compareResults ? `${Object.keys(compareTodayData).length} tickers` : "Drop ALL daily + hourly CSVs"}</div>
+                    <input ref={compareBatchRef} type="file" accept=".csv" multiple style={{ display: "none" }} onChange={e => { if (e.target.files.length) handleCompareBatch(e.target.files); }} />
+                  </div>
+                </div>
+                {/* Compare Log */}
+                {compareLog.length > 0 && (
+                  <div style={{ background: "rgba(0,0,0,0.25)", borderRadius: 6, padding: 8, maxHeight: 120, overflowY: "auto", marginBottom: 8 }}>
+                    {compareLog.map((l, i) => <div key={i} style={{ fontSize: 9, color: l.startsWith("✅") ? "#00e676" : l.startsWith("❌") ? "#ff1744" : l.includes("RESULTS") ? "#a78bfa" : l.includes("Win rate") ? "#ffd600" : "#94a3b8", padding: "1px 0", fontFamily: "monospace" }}>{l}</div>)}
+                  </div>
+                )}
+                {/* Results Table */}
+                {compareResults && compareResults.length > 0 && (
+                  <div>
+                    {/* Summary bar */}
+                    <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                      {[
+                        { label: "CORRECT", count: compareResults.filter(r => r.correct === true).length, color: "#00e676" },
+                        { label: "PARTIAL", count: compareResults.filter(r => r.correct === "partial").length, color: "#ffd600" },
+                        { label: "WRONG", count: compareResults.filter(r => r.correct === false).length, color: "#ff1744" },
+                        { label: "NO DATA", count: compareResults.filter(r => r.correct === null).length, color: "#64748b" },
+                      ].map(s => (
+                        <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 4, padding: "4px 10px", background: s.color + "12", border: `1px solid ${s.color}33`, borderRadius: 5 }}>
+                          <span style={{ fontSize: 16, fontWeight: 900, color: s.color }}>{s.count}</span>
+                          <span style={{ fontSize: 8, fontWeight: 700, color: s.color }}>{s.label}</span>
+                        </div>
+                      ))}
+                      <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "4px 10px", background: "#a78bfa12", border: "1px solid #a78bfa33", borderRadius: 5, marginLeft: "auto" }}>
+                        <span style={{ fontSize: 12, fontWeight: 900, color: "#a78bfa" }}>{(() => { const w = compareResults.filter(r => r.correct === true).length; const t = compareResults.filter(r => r.correct !== null).length; return t > 0 ? (w / t * 100).toFixed(0) : 0; })()}%</span>
+                        <span style={{ fontSize: 8, fontWeight: 700, color: "#a78bfa" }}>WIN RATE</span>
+                      </div>
+                    </div>
+                    {/* Table header */}
+                    <div style={{ display: "grid", gridTemplateColumns: "55px 35px 50px 55px 55px 50px 40px 1fr", gap: 2, padding: "4px 6px", background: "rgba(0,0,0,0.3)", borderRadius: 4, marginBottom: 2 }}>
+                      {["TICKER", "GRD", "DIR", "PREV $", "NOW $", "MOVE", "RESULT", "NOTE"].map(h => (
+                        <div key={h} style={{ fontSize: 7, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</div>
+                      ))}
+                    </div>
+                    <div style={{ maxHeight: 300, overflowY: "auto" }}>
+                      {compareResults.map((r, i) => {
+                        const rc = r.correct === true ? "#00e676" : r.correct === "partial" ? "#ffd600" : r.correct === false ? "#ff1744" : "#64748b";
+                        const dc = r.prevDir === "CALLS" ? "#00e676" : r.prevDir === "PUTS" ? "#ff1744" : "#ffd600";
+                        return (
+                          <div key={i} style={{ display: "grid", gridTemplateColumns: "55px 35px 50px 55px 55px 50px 40px 1fr", gap: 2, padding: "5px 6px", borderBottom: "1px solid #1e293b15", alignItems: "center" }}>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: "#e2e8f0" }}>{r.tkr}</div>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: rc }}>{r.prevGrade}</div>
+                            <div style={{ fontSize: 9, fontWeight: 700, color: dc }}>{r.prevDir === "CALLS" ? "📈" : r.prevDir === "PUTS" ? "📉" : "⏸"} {r.prevDir}</div>
+                            <div style={{ fontSize: 9, color: "#94a3b8" }}>${r.prevPrice?.toFixed(2)}</div>
+                            <div style={{ fontSize: 9, color: "#e2e8f0" }}>{r.todayClose ? `$${r.todayClose.toFixed(2)}` : "—"}</div>
+                            <div style={{ fontSize: 9, fontWeight: 700, color: parseFloat(r.movePct) > 0 ? "#00e676" : parseFloat(r.movePct) < 0 ? "#ff1744" : "#64748b" }}>{r.movePct ? `${parseFloat(r.movePct) > 0 ? "+" : ""}${r.movePct}%` : "—"}</div>
+                            <div style={{ fontSize: 10, fontWeight: 900, color: rc }}>{r.correct === true ? "✅" : r.correct === "partial" ? "🟡" : r.correct === false ? "❌" : "—"}</div>
+                            <div style={{ fontSize: 8, color: "#94a3b8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.note}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {/* Download comparison results */}
+                    <div style={{ textAlign: "center", marginTop: 8 }}>
+                      <button onClick={() => {
+                        const csv = "Ticker,Grade,Dir,Prev Price,Today Close,Move %,Result,Note\n" + compareResults.map(r => `${r.tkr},${r.prevGrade},${r.prevDir},$${r.prevPrice?.toFixed(2) || ""},${r.todayClose ? "$" + r.todayClose.toFixed(2) : ""},${r.movePct || ""},${r.correct === true ? "CORRECT" : r.correct === "partial" ? "PARTIAL" : r.correct === false ? "WRONG" : "NO DATA"},"${r.note}"`).join("\n");
+                        setCompareCsvText(csv);
+                      }} style={{ background: "transparent", border: "1px solid #a78bfa44", borderRadius: 4, padding: "4px 12px", color: "#a78bfa", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>📥 Download Comparison CSV</button>
+                      {compareCsvText && <button onClick={() => setCompareCsvText("")} style={{ background: "transparent", border: "1px solid #64748b44", borderRadius: 4, padding: "3px 6px", color: "#64748b", fontFamily: "inherit", fontSize: 8, cursor: "pointer", marginLeft: 4 }}>✕</button>}
+                      <button onClick={() => { setCompareCsv(null); setCompareTodayData({}); setCompareResults(null); setCompareLog([]); setCompareCsvText(""); }} style={{ background: "transparent", border: "1px solid #dc262644", borderRadius: 4, padding: "4px 12px", color: "#dc2626", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer", marginLeft: 6 }}>🗑 RESET</button>
+                    </div>
+                    {compareCsvText && (
+                      <div style={{ marginTop: 6, background: "rgba(0,0,0,0.3)", borderRadius: 6, padding: 8 }}>
+                        <div style={{ fontSize: 8, color: "#a78bfa", fontWeight: 700, marginBottom: 4 }}>CLICK THE TEXT BOX → Ctrl+A (select all) → Ctrl+C (copy) → PASTE TO ME IN CHAT</div>
+                        <textarea readOnly value={compareCsvText} onClick={e => e.target.select()} style={{ width: "100%", height: 80, background: "#0a0e17", border: "1px solid #a78bfa33", borderRadius: 4, color: "#e2e8f0", fontFamily: "monospace", fontSize: 8, padding: 6, resize: "vertical", outline: "none" }} />
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* ── SCANS TABLE ── */}
         {Object.keys(scans).length > 0 && (
           <div style={{ background: "rgba(17,24,39,0.8)", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
@@ -2271,35 +2681,71 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
                 {Object.values(scans).some(s => s.grade >= 9) && <button onClick={fetchBatchAI} disabled={batchAILoading} style={{ background: batchAILoading ? "#1e293b" : "linear-gradient(135deg,#f59e0b,#ff6d00)", border: "none", borderRadius: 4, padding: "3px 10px", color: "#fff", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: batchAILoading ? "wait" : "pointer" }}>{batchAILoading ? "⏳ Running..." : `🤖 AI on 9+ (${Object.values(scans).filter(s => s.grade >= 9).length})`}</button>}
                 {earningsLoading && <span style={{ fontSize: 8, color: "#00b0ff", fontWeight: 700, padding: "3px 6px" }}>📅 Earnings loading...</span>}
 
+                <button onClick={() => {
+                  const rows = Object.values(scans).sort((a, b) => b.grade - a.grade);
+                  const csv = "Ticker,Grade,Dir,Price,T1,T2,T3,T4,T5,H Divergence,D Divergence,Combined,Bot Right or Wrong\n" + rows.map(s => `${s.ticker},${s.grade},${s.direction},$${s.price},${s.t1},${s.t2},${s.t3},${s.t4},${s.t5},${s.hDiv?.label || "—"},${s.dDiv?.label || "—"},${s.cDiv?.label || "—"},`).join("\n");
+                  setCsvText(csv);
+                }} style={{ background: "transparent", border: "1px solid #00b0ff44", borderRadius: 4, padding: "3px 8px", color: "#00b0ff", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>📋 CSV</button>
+                {csvText && <button onClick={() => setCsvText("")} style={{ background: "transparent", border: "1px solid #64748b44", borderRadius: 4, padding: "3px 6px", color: "#64748b", fontFamily: "inherit", fontSize: 8, cursor: "pointer" }}>✕</button>}
                 <button onClick={clearScans} style={{ background: "transparent", border: "1px solid #dc262644", borderRadius: 4, padding: "3px 8px", color: "#dc2626", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>🗑 CLEAR</button>
               </div>
             </div>
-            {/* Regime banner */}
-            {Object.keys(regimeData).length > 0 && (
-              <div style={{ display: "flex", gap: 6, marginBottom: 6, padding: "5px 8px", background: "rgba(0,0,0,0.25)", borderRadius: 5, alignItems: "center", flexWrap: "wrap" }}>
-                <span style={{ fontSize: 8, fontWeight: 700, color: "#64748b", letterSpacing: 1 }}>REGIME:</span>
-                {Object.entries(regimeData).map(([tkr, r]) => {
-                  const c = r.direction === "BULLISH" ? "#00e676" : r.direction === "BEARISH" ? "#ff1744" : "#ffd600";
-                  return (<span key={tkr} style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "2px 6px", background: c + "15", border: `1px solid ${c}33`, borderRadius: 3, fontSize: 8, fontWeight: 700 }}>
-                    <span style={{ color: c }}>{tkr}</span>
-                    <span style={{ color: "#94a3b8" }}>{r.direction} ({r.pct5d}% 5d)</span>
-                    <span style={{ color: "#64748b" }}>RSI {r.rsi}</span>
-                  </span>);
-                })}
+            {/* Regime banner — DISABLED: pure technicals mode */}
+            {/* CSV textarea fallback */}
+            {csvText && (
+              <div style={{ marginBottom: 6, background: "rgba(0,0,0,0.3)", borderRadius: 6, padding: 8 }}>
+                <div style={{ fontSize: 8, color: "#00b0ff", fontWeight: 700, marginBottom: 4 }}>CLICK THE TEXT BOX → Ctrl+A (select all) → Ctrl+C (copy) → PASTE TO ME IN CHAT</div>
+                <textarea readOnly value={csvText} onClick={e => e.target.select()} style={{ width: "100%", height: 100, background: "#0a0e17", border: "1px solid #00b0ff33", borderRadius: 4, color: "#e2e8f0", fontFamily: "monospace", fontSize: 8, padding: 6, resize: "vertical", outline: "none" }} />
               </div>
             )}
-            {/* Table header */}
-            <div style={{ display: "grid", gridTemplateColumns: "60px 40px 65px 55px 55px 55px 55px 55px 55px 140px", gap: 2, padding: "4px 6px", background: "rgba(0,0,0,0.3)", borderRadius: 4, marginBottom: 2 }}>
-              {["TICKER", "GRD", "DIR", "PRICE", "T1", "T2", "T3", "T4", "T5", "EARNINGS"].map(h => (
-                <div key={h} style={{ fontSize: 7, fontWeight: 700, color: h === "EARNINGS" ? "#00b0ff" : "#64748b", textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</div>
-              ))}
+            {/* Filter controls */}
+            <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap", alignItems: "center" }}>
+              <span style={{ fontSize: 7, fontWeight: 700, color: "#64748b", letterSpacing: 1 }}>FILTER:</span>
+              <select value={filterGrade} onChange={e => setFilterGrade(e.target.value)} style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 3, padding: "2px 4px", color: "#e2e8f0", fontFamily: "inherit", fontSize: 8, outline: "none" }}>
+                {["ALL", "7+", "6+", "5+", "≤4"].map(o => <option key={o} value={o}>{o === "ALL" ? "Grade: All" : `Grade ${o}`}</option>)}
+              </select>
+              <select value={filterDir} onChange={e => setFilterDir(e.target.value)} style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 3, padding: "2px 4px", color: "#e2e8f0", fontFamily: "inherit", fontSize: 8, outline: "none" }}>
+                {["ALL", "PUTS", "CALLS", "WAIT"].map(o => <option key={o} value={o}>{o === "ALL" ? "Dir: All" : o}</option>)}
+              </select>
+              <select value={filterCombined} onChange={e => setFilterCombined(e.target.value)} style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 3, padding: "2px 4px", color: "#e2e8f0", fontFamily: "inherit", fontSize: 8, outline: "none" }}>
+                {["ALL", "BOTH BULL", "BOTH BEAR", "CONFLICT", "HRLY ONLY", "DAILY ONLY", "MIXED", "—"].map(o => <option key={o} value={o}>{o === "ALL" ? "Combined: All" : o}</option>)}
+              </select>
+              {(filterGrade !== "ALL" || filterDir !== "ALL" || filterCombined !== "ALL") && <button onClick={() => { setFilterGrade("ALL"); setFilterDir("ALL"); setFilterCombined("ALL"); }} style={{ background: "transparent", border: "1px solid #64748b33", borderRadius: 3, padding: "2px 6px", color: "#64748b", fontFamily: "inherit", fontSize: 7, cursor: "pointer" }}>✕ Reset</button>}
             </div>
-            {/* Table rows — sorted by grade desc */}
+            {/* Table header — click GRD/DIR/COMBINED to sort */}
+            <div style={{ display: "grid", gridTemplateColumns: "55px 30px 55px 52px 52px 52px 52px 52px 52px 70px 60px 60px 70px", gap: 2, padding: "4px 6px", background: "rgba(0,0,0,0.3)", borderRadius: 4, marginBottom: 2, minWidth: 700, overflowX: "auto" }}>
+              {["TICKER", "GRD", "DIR", "PRICE", "T1", "T2", "T3", "T4", "T5", "EARNINGS", "H DIV", "D DIV", "COMBINED"].map(h => {
+                const sortable = h === "GRD" || h === "DIR" || h === "COMBINED";
+                const sortKey = h === "GRD" ? "grade" : h === "DIR" ? "dir" : h === "COMBINED" ? "combined" : null;
+                const isActive = sortKey && sortCol === sortKey;
+                return (
+                  <div key={h} onClick={sortable ? () => { if (sortCol === sortKey) setSortAsc(!sortAsc); else { setSortCol(sortKey); setSortAsc(false); } } : undefined}
+                    style={{ fontSize: 7, fontWeight: 700, color: isActive ? "#e2e8f0" : h === "EARNINGS" ? "#00b0ff" : h.includes("DIV") || h === "COMBINED" ? "#a78bfa" : "#64748b", textTransform: "uppercase", letterSpacing: 0.5, cursor: sortable ? "pointer" : "default", userSelect: "none" }}>
+                    {h}{isActive ? (sortAsc ? " ▲" : " ▼") : ""}
+                  </div>
+                );
+              })}
+            </div>
+            {/* Table rows — filtered & sorted */}
             <div style={{ maxHeight: 300, overflowY: "auto" }}>
-              {Object.values(scans).sort((a, b) => b.grade - a.grade).map(s => {
+              {(() => {
+                let rows = Object.values(scans);
+                // Filter
+                if (filterDir !== "ALL") rows = rows.filter(s => s.direction === filterDir);
+                if (filterGrade === "7+") rows = rows.filter(s => s.grade >= 7);
+                else if (filterGrade === "6+") rows = rows.filter(s => s.grade >= 6);
+                else if (filterGrade === "5+") rows = rows.filter(s => s.grade >= 5);
+                else if (filterGrade === "≤4") rows = rows.filter(s => s.grade <= 4);
+                if (filterCombined !== "ALL") rows = rows.filter(s => (s.cDiv?.label || "—") === filterCombined);
+                // Sort
+                const dir = sortAsc ? 1 : -1;
+                if (sortCol === "grade") rows.sort((a, b) => dir * (a.grade - b.grade));
+                else if (sortCol === "dir") rows.sort((a, b) => dir * (a.direction || "").localeCompare(b.direction || ""));
+                else if (sortCol === "combined") rows.sort((a, b) => dir * ((a.cDiv?.label || "—").localeCompare(b.cDiv?.label || "—")));
+                return rows.map(s => {
                 const dc = s.direction === "CALLS" ? "#00e676" : s.direction === "PUTS" ? "#ff1744" : "#ffd600";
                 return (
-                  <div key={s.ticker} onDoubleClick={() => loadScan(s.ticker)} title={rawDataRef.current[s.ticker] ? `Double-click to open ${s.ticker} full analysis` : `${s.ticker}: re-upload to enable full view`} style={{ display: "grid", gridTemplateColumns: "60px 40px 65px 55px 55px 55px 55px 55px 55px 140px", gap: 2, padding: "4px 6px", borderBottom: "1px solid #1e293b11", fontSize: 10, cursor: "pointer", transition: "background 0.15s" }} onMouseEnter={e => e.currentTarget.style.background = "rgba(124,58,237,0.08)"} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                  <div key={s.ticker} onDoubleClick={() => loadScan(s.ticker)} title={rawDataRef.current[s.ticker] ? `Double-click to open ${s.ticker} full analysis` : `${s.ticker}: re-upload to enable full view`} style={{ display: "grid", gridTemplateColumns: "55px 30px 55px 52px 52px 52px 52px 52px 52px 70px 60px 60px 70px", gap: 2, padding: "4px 6px", borderBottom: "1px solid #1e293b11", fontSize: 10, cursor: "pointer", transition: "background 0.15s", minWidth: 700 }} onMouseEnter={e => e.currentTarget.style.background = "rgba(124,58,237,0.08)"} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
                     <div style={{ fontWeight: 800, color: "#e2e8f0" }}>{s.ticker}</div>
                     <div style={{ fontWeight: 800, color: s.grade >= 7 ? "#00e676" : s.grade >= 5 ? "#ffd600" : "#ff1744" }}>{s.grade}</div>
                     <div style={{ fontWeight: 700, color: dc, fontSize: 9 }}>{s.isReversal ? "🔄" : ""}{s.direction === "CALLS" ? "📈CALL" : s.direction === "PUTS" ? "📉PUT" : "⏸WAIT"}</div>
@@ -2341,9 +2787,13 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
                         </div>}
                       </div>);
                     })() : s.grade >= 9 ? "—" : ""}</div>
+                    <div title={s.hDiv?.detail || ""} style={{ fontSize: 7, fontWeight: 700, color: s.hDiv?.type === "bullish" ? "#00e676" : s.hDiv?.type === "bearish" ? "#ff1744" : s.hDiv?.type === "mixed" ? "#ffd600" : "#64748b" }}>{s.hDiv?.label || "—"}</div>
+                    <div title={s.dDiv?.detail || ""} style={{ fontSize: 7, fontWeight: 700, color: s.dDiv?.type === "bullish" ? "#00e676" : s.dDiv?.type === "bearish" ? "#ff1744" : s.dDiv?.type === "mixed" ? "#ffd600" : "#64748b" }}>{s.dDiv?.label || "—"}</div>
+                    <div title={s.cDiv?.detail || ""} style={{ fontSize: 7, fontWeight: 700, color: s.cDiv?.color || "#64748b" }}>{s.cDiv?.label || "—"}</div>
                   </div>
                 );
-              })}
+              });
+              })()}
             </div>
             <div style={{ fontSize: 8, color: "#64748b", textAlign: "center", marginTop: 6, fontStyle: "italic" }}>Double-click any row to open full analysis</div>
             {/* Batch AI progress */}
@@ -2369,11 +2819,11 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
         )}
 
         {/* ── SINGLE MODE UPLOADS ── */}
-        {viewMode === "analysis" && !batchMode && <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+        {!batchMode && <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
           <UB label="📅 Daily" fr={dR} data={dD} cols={dC} type="daily" color="#00b0ff" />
           <UB label="⏰ Hourly+VWAP" fr={hR} data={hD} cols={hC} type="hourly" color="#ffd600" />
         </div>}
-        {viewMode === "analysis" && !batchMode && (!dD || !hD) && <div style={{ padding: 8, background: "rgba(17,24,39,0.5)", border: "1px solid #1e293b", borderRadius: 6, fontSize: 10, color: "#94a3b8", textAlign: "center" }}>Upload both CSVs.</div>}
+        {!batchMode && (!dD || !hD) && <div style={{ padding: 8, background: "rgba(17,24,39,0.5)", border: "1px solid #1e293b", borderRadius: 6, fontSize: 10, color: "#94a3b8", textAlign: "center" }}>Upload both CSVs.</div>}
         {err && <div style={{ background: "#7f1d1d33", border: "1px solid #dc2626", borderRadius: 6, padding: 6, fontSize: 10, color: "#fca5a5" }}>{err}</div>}
 
         {an && t && (<>
@@ -2413,11 +2863,7 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
             </Card>
           )}
 
-          {t.regimeAdj && (
-            <Card accent={t.regimeAdj.effect === "tailwind" ? "#00e676" : "#ff1744"} title={`🌍 Market Regime — ${t.regimeAdj.effect === "tailwind" ? "Tailwind" : "Headwind"}`}>
-              <div style={{ fontSize: 11, color: "#e2e8f0", lineHeight: 1.6, whiteSpace: "pre-wrap", background: `rgba(${t.regimeAdj.effect === "tailwind" ? "0,230,118" : "255,23,68"},0.06)`, padding: 10, borderRadius: 5 }}>{t.regimeAdj.text}</div>
-            </Card>
-          )}
+          {/* Regime card — DISABLED: pure technicals mode */}
 
           {t.reversalInfo?.isReversal && (
             <Card accent="#f59e0b" title={`🔄 Reversal Detected — ${t.reversalInfo.confidence} Confidence`}>
@@ -2495,7 +2941,7 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
               {t.extremeWarning && <div style={{ padding: "4px 8px", marginBottom: 6, background: "#ff174412", border: "1px solid #ff174433", borderRadius: 4, fontSize: 10 }}><span style={{ color: "#ff1744", fontWeight: 700 }}>🚨 RSI Extreme:</span> <span style={{ color: "#e2e8f0" }}>Grade {t.extremeWarning.gradeAdj} ({t.extremeWarning.type === "oversold_bounce" ? "oversold snap-back risk" : "overbought reversal risk"})</span></div>}
               {t.earningsAdj && <div style={{ padding: "4px 8px", marginBottom: 6, background: t.earningsAdj.effect === "tailwind" ? "#00e67612" : t.earningsAdj.effect === "headwind" ? "#ff980012" : "#00b0ff12", border: `1px solid ${t.earningsAdj.effect === "tailwind" ? "#00e67633" : t.earningsAdj.effect === "headwind" ? "#ff980033" : "#00b0ff33"}`, borderRadius: 4, fontSize: 10 }}><span style={{ color: t.earningsAdj.effect === "tailwind" ? "#00e676" : t.earningsAdj.effect === "headwind" ? "#ff9800" : "#00b0ff", fontWeight: 700 }}>📅 Earnings ({t.earningsAdj.daysUntil}d):</span> <span style={{ color: "#e2e8f0" }}>{t.earningsAdj.effect}</span></div>}
               {t.rsiCap && <div style={{ padding: "4px 8px", marginBottom: 6, background: "#ff6d0012", border: "1px solid #ff6d0033", borderRadius: 4, fontSize: 10 }}><span style={{ color: "#ff6d00", fontWeight: 700 }}>⛔ Grade Cap:</span> <span style={{ color: "#e2e8f0" }}>Capped at 7 (was {t.rsiCap.cappedFrom}) — RSI extreme</span></div>}
-              {t.regimeAdj && <div style={{ padding: "4px 8px", marginBottom: 6, background: t.regimeAdj.effect === "tailwind" ? "#00e67612" : "#ff174412", border: `1px solid ${t.regimeAdj.effect === "tailwind" ? "#00e67633" : "#ff174433"}`, borderRadius: 4, fontSize: 10 }}><span style={{ color: t.regimeAdj.effect === "tailwind" ? "#00e676" : "#ff1744", fontWeight: 700 }}>🌍 Regime:</span> <span style={{ color: "#e2e8f0" }}>{t.regimeAdj.effect === "tailwind" ? "+" : ""}{t.regimeAdj.gradeAdj} ({t.regimeAdj.effect})</span></div>}
+              {t.divAdj && <div style={{ padding: "4px 8px", marginBottom: 6, background: "#f59e0b12", border: "1px solid #f59e0b33", borderRadius: 4, fontSize: 10 }}><span style={{ color: "#f59e0b", fontWeight: 700 }}>⚠️ Div Conflict:</span> <span style={{ color: "#e2e8f0" }}>{t.divAdj.gradeAdj > 0 ? "+" : ""}{t.divAdj.gradeAdj} — RSI divergence opposes {t.direction}</span></div>}
               {t.reversalInfo?.isReversal && <div style={{ padding: "4px 8px", marginBottom: 6, background: "#f59e0b12", border: "1px solid #f59e0b33", borderRadius: 4, fontSize: 10 }}><span style={{ color: "#f59e0b", fontWeight: 700 }}>🔄 Reversal:</span> <span style={{ color: "#e2e8f0" }}>{t.reversalInfo.signals.length} signals, score {t.reversalInfo.score} ({t.reversalInfo.confidence})</span></div>}
               {t.patternAdj && <div style={{ padding: "4px 8px", marginBottom: 6, background: t.patternAdj.adj > 0 ? "#00e67612" : "#ff174412", border: `1px solid ${t.patternAdj.adj > 0 ? "#00e67633" : "#ff174433"}`, borderRadius: 4, fontSize: 10 }}><span style={{ color: t.patternAdj.adj > 0 ? "#00e676" : "#ff1744", fontWeight: 700 }}>{t.patternAdj.adj > 0 ? "📈" : "📉"} Pattern:</span> <span style={{ color: "#e2e8f0" }}>{t.patternAdj.adj > 0 ? "+" : ""}{t.patternAdj.adj} — {t.patternAdj.note}</span></div>}
               <div style={{ fontSize: 9, fontWeight: 700, color: "#00b0ff", marginBottom: 3 }}>DAILY</div>
@@ -2591,6 +3037,6 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
             <button onClick={() => { setDD(null); setHD(null); setDC(null); setHC(null); setAn(null); setAI(""); setErr(""); setBatchLog([]); }} style={{ background: "transparent", border: "1px solid #1e293b", borderRadius: 5, padding: "4px 12px", color: "#64748b", fontFamily: "inherit", fontSize: 9, cursor: "pointer" }}>RESET</button>
           </div>
         </>)}
-      </div>
+      </div>}
     </div>);
 }
