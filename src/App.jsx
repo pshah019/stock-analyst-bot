@@ -2307,7 +2307,7 @@ T3 $${t.targets[2]?.price.toFixed(2) || "—"}: XX% — reason
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
     try {
-      const r = await fetch("https://api.anthropic.com/v1/messages", {
+      const r = await fetch("/api/claude", {
         method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
         body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000,
           tools: [{ type: "web_search_20250305", name: "web_search" }],
@@ -2365,7 +2365,7 @@ Concise (1-2 sentences each):
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 30000);
       try {
-        const r = await fetch("https://api.anthropic.com/v1/messages", {
+        const r = await fetch("/api/claude", {
           method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
           body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 800,
             tools: [{ type: "web_search_20250305", name: "web_search" }],
@@ -2419,7 +2419,7 @@ Valid values for "reception": "positive", "negative", "mixed"
 Valid values for "postEarningsDir": "up", "down", "flat"
 Valid values for "sentiment": "bullish", "bearish", "neutral"`;
 
-      const r = await fetch("https://api.anthropic.com/v1/messages", {
+      const r = await fetch("/api/claude", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-20250514", max_tokens: 3000,
