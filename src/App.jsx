@@ -2222,6 +2222,7 @@ export default function App() {
           hDiv: trade.hDiv, dDiv: trade.dDiv, cDiv: trade.cDiv, divAdj: trade.divAdj,
         };
         setScans(prev => ({ ...prev, [tkr]: scan }));
+        saveResultToSupabase(scan);
         rawDataRef.current[tkr] = { daily: p.daily, hourly: p.hourly };
         const dc = trade.reversalInfo?.isReversal ? "🔄" : trade.direction === "CALLS" ? "📈" : trade.direction === "PUTS" ? "📉" : "⏸";
         log.push(`✅ ${tkr}: ${dc} ${trade.direction}${trade.reversalInfo?.isReversal ? " (REVERSAL)" : ""} Grade ${trade.grade}/10 — $${trade.price}`);
