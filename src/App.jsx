@@ -5,7 +5,7 @@ import { supabase } from "./supabase";
 // ─── Supabase helpers ───
 async function saveResultToSupabase(scan) {
   try {
-    const { error } = await supabase.from("analysis_results").insert([{
+    const row = {
       ticker: scan.ticker,
       grade: scan.grade,
       direction: scan.direction,
@@ -21,7 +21,15 @@ async function saveResultToSupabase(scan) {
       d_div: scan.dDiv?.label || null,
       combined_div: scan.cDiv?.label || null,
       analyzed_at: scan.timestamp || new Date().toISOString(),
-    }]);
+      analysis_version: scan.version || "v1",
+    };
+    if (scan.version === "v2") {
+      row.conviction_tier = scan.tier;
+      row.v2_score = scan.score;
+      row.trade_ticket = scan.tradeTicket || null;
+      row.v2_signals = scan.signals || null;
+    }
+    const { error } = await supabase.from("analysis_results").insert([row]);
     if (error) console.warn("Supabase save error:", error.message);
     else console.log(`Saved ${scan.ticker} to Supabase`);
   } catch (e) {
@@ -1928,12 +1936,725 @@ function combinedDivergence(daily, hourly) {
   return { label: "—", color: "#64748b", detail: "" };
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// ═══  V2 ANALYSIS ENGINE  (additive — v1 pathways untouched)  ════════
+// ═════════════════════════════════════════════════════════════════════
+// See V2-ANALYSIS-SPEC.md for the full design.
+
+const V2_NONE = { fired: false, side: null, strength: 0, detail: "" };
+
+function v2Slope(arr) {
+  const n = arr.length; if (n < 2) return 0;
+  let sX = 0, sY = 0, sXY = 0, sX2 = 0;
+  for (let i = 0; i < n; i++) { sX += i; sY += arr[i]; sXY += i * arr[i]; sX2 += i * i; }
+  const d = n * sX2 - sX * sX; return d === 0 ? 0 : (n * sXY - sX * sY) / d;
+}
+function v2SMA(arr, period) {
+  const r = []; for (let i = 0; i < arr.length; i++) {
+    if (i < period - 1) { r.push(null); continue; }
+    let s = 0; for (let j = i - period + 1; j <= i; j++) s += arr[j]; r.push(s / period);
+  } return r;
+}
+function v2PivotHighs(data, lb = 3) {
+  const out = []; for (let i = lb; i < data.length - lb; i++) {
+    let ok = true; for (let j = i - lb; j <= i + lb; j++) { if (j !== i && data[j].high >= data[i].high) { ok = false; break; } }
+    if (ok) out.push({ idx: i, price: data[i].high });
+  } return out;
+}
+function v2PivotLows(data, lb = 3) {
+  const out = []; for (let i = lb; i < data.length - lb; i++) {
+    let ok = true; for (let j = i - lb; j <= i + lb; j++) { if (j !== i && data[j].low <= data[i].low) { ok = false; break; } }
+    if (ok) out.push({ idx: i, price: data[i].low });
+  } return out;
+}
+function v2ATR(data) { const a = computeATR(data); return a[a.length - 1] || (data[data.length - 1].high - data[data.length - 1].low); }
+
+// ── 2.1 Bull Flag ──
+function detectBullFlag(data) {
+  if (data.length < 25) return V2_NONE;
+  const recent = data.slice(-25), last = recent[recent.length - 1];
+  // Pole: check for ≥5% move up over any 10-bar window ending 5-15 bars ago
+  let bestPole = 0, poleEndIdx = -1;
+  for (let end = 8; end <= 18; end++) {
+    if (end >= recent.length) break;
+    const startIdx = Math.max(0, end - 10);
+    const move = (recent[end].close - recent[startIdx].low) / recent[startIdx].low;
+    if (move > bestPole) { bestPole = move; poleEndIdx = end; }
+  }
+  if (bestPole < 0.05 || poleEndIdx < 0) return V2_NONE;
+  // Flag: after pole, lower-ish highs with contained range, duration 5-15 bars
+  const flag = recent.slice(poleEndIdx, recent.length);
+  if (flag.length < 4) return V2_NONE;
+  const fHighs = flag.map(b => b.high), fLows = flag.map(b => b.low);
+  const highSlope = v2Slope(fHighs), lowSlope = v2Slope(fLows);
+  // Flag should slope gently down or sideways
+  if (highSlope > 0 && highSlope / last.close > 0.003) return V2_NONE;
+  const flagRange = Math.max(...fHighs) - Math.min(...fLows);
+  const atr = v2ATR(data); if (flagRange > atr * 3) return V2_NONE;
+  // Trigger: last close breaking above the flag's top trendline
+  const topLine = Math.max(...fHighs.slice(0, -1));
+  const broke = last.close > topLine;
+  const volAvg = data.slice(-20).reduce((s, d) => s + (d.volume || 0), 0) / 20;
+  const volOK = (last.volume || 0) > volAvg * 1.3;
+  let strength = 0;
+  if (broke && volOK) strength = 5;
+  else if (broke) strength = 4;
+  else if (flag.length >= 5) strength = 3;
+  else strength = 2;
+  return { fired: true, side: "bull", strength, detail: `Pole +${(bestPole * 100).toFixed(1)}%, ${flag.length}-bar flag top $${topLine.toFixed(2)}${broke ? " — BROKEN" + (volOK ? " w/ vol" : "") : ""}` };
+}
+// ── 2.2 Bear Flag ──
+function detectBearFlag(data) {
+  if (data.length < 25) return V2_NONE;
+  const recent = data.slice(-25), last = recent[recent.length - 1];
+  let bestPole = 0, poleEndIdx = -1;
+  for (let end = 8; end <= 18; end++) {
+    if (end >= recent.length) break;
+    const startIdx = Math.max(0, end - 10);
+    const drop = (recent[startIdx].high - recent[end].close) / recent[startIdx].high;
+    if (drop > bestPole) { bestPole = drop; poleEndIdx = end; }
+  }
+  if (bestPole < 0.05 || poleEndIdx < 0) return V2_NONE;
+  const flag = recent.slice(poleEndIdx, recent.length);
+  if (flag.length < 4) return V2_NONE;
+  const fHighs = flag.map(b => b.high), fLows = flag.map(b => b.low);
+  const lowSlope = v2Slope(fLows);
+  if (lowSlope < 0 && Math.abs(lowSlope) / last.close > 0.003) return V2_NONE;
+  const flagRange = Math.max(...fHighs) - Math.min(...fLows);
+  const atr = v2ATR(data); if (flagRange > atr * 3) return V2_NONE;
+  const botLine = Math.min(...fLows.slice(0, -1));
+  const broke = last.close < botLine;
+  const volAvg = data.slice(-20).reduce((s, d) => s + (d.volume || 0), 0) / 20;
+  const volOK = (last.volume || 0) > volAvg * 1.3;
+  let strength = broke && volOK ? 5 : broke ? 4 : flag.length >= 5 ? 3 : 2;
+  return { fired: true, side: "bear", strength, detail: `Pole −${(bestPole * 100).toFixed(1)}%, ${flag.length}-bar flag bottom $${botLine.toFixed(2)}${broke ? " — BROKEN" + (volOK ? " w/ vol" : "") : ""}` };
+}
+// ── 2.3 Pennant (symmetric triangle) ──
+function detectPennant(data) {
+  if (data.length < 20) return V2_NONE;
+  const recent = data.slice(-20), last = recent[recent.length - 1], atr = v2ATR(data);
+  const hs = v2PivotHighs(recent, 2), ls = v2PivotLows(recent, 2);
+  if (hs.length < 2 || ls.length < 2) return V2_NONE;
+  const hSlope = v2Slope(hs.map(p => p.price)), lSlope = v2Slope(ls.map(p => p.price));
+  // Pennant: highs sloping down, lows sloping up (convergence)
+  if (hSlope >= 0 || lSlope <= 0) return V2_NONE;
+  const latestHigh = hs[hs.length - 1].price, latestLow = ls[ls.length - 1].price;
+  const apexDist = latestHigh - latestLow;
+  if (apexDist > atr * 5) return V2_NONE;
+  // Trigger: close outside the converging lines
+  const breakUp = last.close > latestHigh, breakDown = last.close < latestLow;
+  if (breakUp) return { fired: true, side: "bull", strength: 5, detail: `Pennant breakout UP — apex ~$${((latestHigh + latestLow) / 2).toFixed(2)}, broke $${latestHigh.toFixed(2)}` };
+  if (breakDown) return { fired: true, side: "bear", strength: 5, detail: `Pennant breakdown — apex ~$${((latestHigh + latestLow) / 2).toFixed(2)}, broke $${latestLow.toFixed(2)}` };
+  if (apexDist < atr * 2) {
+    const priorBias = v2Slope(data.slice(-35, -15).map(d => d.close)) > 0 ? "bull" : "bear";
+    return { fired: true, side: priorBias, strength: 3, detail: `Pennant forming, apex dist ${(apexDist / atr).toFixed(1)} ATR — prior ${priorBias} bias` };
+  }
+  return V2_NONE;
+}
+// ── 2.4 Retest & Break ──
+function detectRetestBreak(data, sr) {
+  if (data.length < 20 || !sr) return V2_NONE;
+  const recent = data.slice(-15), last = recent[recent.length - 1], atr = v2ATR(data);
+  // Bull: broke above a resistance recently then pulled back near it and held
+  for (const r of (sr.resistance || [])) {
+    const level = r.avg;
+    let brokeIdx = -1;
+    for (let i = 0; i < recent.length - 2; i++) if (recent[i].close > level + atr * 0.2) { brokeIdx = i; break; }
+    if (brokeIdx < 0) continue;
+    const after = recent.slice(brokeIdx + 1);
+    const nearRetest = after.some(b => Math.abs(b.low - level) < atr * 0.5 && b.low >= level - atr * 0.5);
+    if (nearRetest && last.close > level && last.close > recent[brokeIdx].close * 0.98) {
+      return { fired: true, side: "bull", strength: 5, detail: `Retest-and-go above $${level.toFixed(2)} confirmed` };
+    }
+  }
+  // Bear: broke below a support recently then bounced back to it and got rejected
+  for (const s of (sr.support || [])) {
+    const level = s.avg;
+    let brokeIdx = -1;
+    for (let i = 0; i < recent.length - 2; i++) if (recent[i].close < level - atr * 0.2) { brokeIdx = i; break; }
+    if (brokeIdx < 0) continue;
+    const after = recent.slice(brokeIdx + 1);
+    const nearRetest = after.some(b => Math.abs(b.high - level) < atr * 0.5 && b.high <= level + atr * 0.5);
+    if (nearRetest && last.close < level) {
+      return { fired: true, side: "bear", strength: 5, detail: `Broke & retested support $${level.toFixed(2)} — rejection confirmed` };
+    }
+  }
+  return V2_NONE;
+}
+// ── 2.5 Volume Surge ──
+function detectVolumeSurge(data) {
+  if (data.length < 25) return V2_NONE;
+  const last = data[data.length - 1];
+  const baseline = data.slice(-25, -5).reduce((s, d) => s + (d.volume || 0), 0) / 20;
+  if (!baseline) return V2_NONE;
+  const relVol = (last.volume || 0) / baseline;
+  const recent5Avg = data.slice(-5).reduce((s, d) => s + (d.volume || 0), 0) / 5;
+  const building = recent5Avg > baseline * 1.3;
+  const dir = last.close > last.open ? "bull" : "bear";
+  let strength = 0;
+  if (relVol >= 3) strength = 5;
+  else if (relVol >= 2) strength = 4;
+  else if (relVol >= 1.5) strength = 2;
+  else if (building) strength = 2;
+  else return V2_NONE;
+  if (building && strength < 5) strength += 1;
+  return { fired: true, side: dir, strength: Math.min(strength, 5), detail: `${relVol.toFixed(2)}× baseline vol${building ? ", 5-bar avg rising" : ""}, closed ${dir === "bull" ? "up" : "down"}` };
+}
+// ── 2.6 10/20 MA Curl ──
+function detectMACurl(data) {
+  if (data.length < 25) return V2_NONE;
+  const closes = data.map(d => d.close), ma10 = v2SMA(closes, 10), ma20 = v2SMA(closes, 20);
+  const last = data[data.length - 1];
+  const s10recent = v2Slope(ma10.slice(-5).filter(v => v != null));
+  const s10prior = v2Slope(ma10.slice(-8, -3).filter(v => v != null));
+  const s20recent = v2Slope(ma20.slice(-5).filter(v => v != null));
+  const bullCurl = s10recent > 0 && s20recent > 0 && s10recent > s10prior;
+  const bearCurl = s10recent < 0 && s20recent < 0 && s10recent < s10prior;
+  if (!bullCurl && !bearCurl) return V2_NONE;
+  const m10 = ma10[ma10.length - 1], m20 = ma20[ma20.length - 1];
+  const priceAbove = last.close > m10 && last.close > m20;
+  const priceBelow = last.close < m10 && last.close < m20;
+  let strength;
+  if (bullCurl && priceAbove) strength = 4;
+  else if (bearCurl && priceBelow) strength = 4;
+  else strength = 3;
+  return { fired: true, side: bullCurl ? "bull" : "bear", strength, detail: `10/20 MAs curling ${bullCurl ? "up" : "down"} (slope ${s10recent.toFixed(3)}), price ${priceAbove ? "above" : priceBelow ? "below" : "inside"} band` };
+}
+// ── 2.7 Divergence (reuse v1) → wrapped ──
+function v2WrapDivergence(divResult) {
+  if (!divResult || divResult.type === "none") return V2_NONE;
+  const side = divResult.type === "bullish" ? "bull" : divResult.type === "bearish" ? "bear" : null;
+  if (!side) return V2_NONE;
+  return { fired: true, side, strength: 4, detail: divResult.label || `${side} divergence` };
+}
+// ── 2.8 Cup & Handle ──
+function detectCupHandle(data) {
+  if (data.length < 50) return V2_NONE;
+  const window = data.slice(-80), closes = window.map(d => d.close);
+  // Left rim = max in first third; bottom = min overall; right rim = max in last third excluding handle
+  const third = Math.floor(window.length / 3);
+  const leftRim = Math.max(...closes.slice(0, third)), leftIdx = closes.slice(0, third).indexOf(leftRim);
+  const bottom = Math.min(...closes.slice(leftIdx, window.length - 10));
+  const rightSection = closes.slice(window.length - third, window.length - 5);
+  if (rightSection.length < 5) return V2_NONE;
+  const rightRim = Math.max(...rightSection);
+  // Rims must be within 3%, cup depth 10-30%
+  if (Math.abs(rightRim - leftRim) / leftRim > 0.04) return V2_NONE;
+  const depth = (leftRim - bottom) / leftRim;
+  if (depth < 0.08 || depth > 0.35) return V2_NONE;
+  // Handle = small pullback last 5-15 bars from right rim
+  const handle = closes.slice(window.length - 10);
+  const handleHigh = Math.max(...handle), handleLow = Math.min(...handle);
+  const handlePullback = (handleHigh - handleLow) / handleHigh;
+  if (handlePullback > 0.15) return V2_NONE;
+  const last = data[data.length - 1];
+  const broken = last.close > rightRim * 1.002;
+  const volAvg = data.slice(-20).reduce((s, d) => s + (d.volume || 0), 0) / 20;
+  const volOK = (last.volume || 0) > volAvg * 1.3;
+  const strength = broken && volOK ? 5 : broken ? 4 : 3;
+  return { fired: true, side: "bull", strength, detail: `Cup bottom $${bottom.toFixed(2)} rims $${leftRim.toFixed(2)}/$${rightRim.toFixed(2)}, handle ${(handlePullback * 100).toFixed(1)}%${broken ? " — BROKE" : ""}` };
+}
+// ── 2.9/2.10 Ascending / Descending Triangle ──
+function detectTriangle(data) {
+  if (data.length < 25) return V2_NONE;
+  const recent = data.slice(-25), last = recent[recent.length - 1], atr = v2ATR(data);
+  const hs = v2PivotHighs(recent, 2), ls = v2PivotLows(recent, 2);
+  if (hs.length < 2 || ls.length < 2) return V2_NONE;
+  const hSlope = v2Slope(hs.map(p => p.price)), lSlope = v2Slope(ls.map(p => p.price));
+  const hPrices = hs.map(p => p.price), lPrices = ls.map(p => p.price);
+  // Ascending: flat resistance + rising support
+  const hFlat = Math.abs(hSlope) / last.close < 0.002 && (Math.max(...hPrices) - Math.min(...hPrices)) / last.close < 0.015;
+  if (hFlat && lSlope > 0) {
+    const resistance = Math.max(...hPrices);
+    const broke = last.close > resistance * 1.002;
+    return { fired: true, side: "bull", strength: broke ? 5 : 4, detail: `Ascending triangle — flat resistance $${resistance.toFixed(2)}${broke ? " BROKEN" : ", rising support"}` };
+  }
+  // Descending: flat support + falling resistance
+  const lFlat = Math.abs(lSlope) / last.close < 0.002 && (Math.max(...lPrices) - Math.min(...lPrices)) / last.close < 0.015;
+  if (lFlat && hSlope < 0) {
+    const support = Math.min(...lPrices);
+    const broke = last.close < support * 0.998;
+    return { fired: true, side: "bear", strength: broke ? 5 : 4, detail: `Descending triangle — flat support $${support.toFixed(2)}${broke ? " BROKEN" : ", falling resistance"}` };
+  }
+  return V2_NONE;
+}
+// ── 2.11 Head & Shoulders (+ inverse) ──
+function detectHeadShoulders(data) {
+  if (data.length < 30) return V2_NONE;
+  const recent = data.slice(-50), atr = v2ATR(data), last = data[data.length - 1];
+  const hs = v2PivotHighs(recent, 3), ls = v2PivotLows(recent, 3);
+  // Regular H&S: find 3 highs where middle is highest, shoulders within 3%
+  if (hs.length >= 3) {
+    for (let i = 0; i <= hs.length - 3; i++) {
+      const L = hs[i], H = hs[i + 1], R = hs[i + 2];
+      if (H.price > L.price && H.price > R.price && Math.abs(L.price - R.price) / H.price < 0.04 && (H.price - L.price) / H.price > 0.02) {
+        // Neckline = lowest low between L and R
+        let neck = Infinity;
+        for (let k = L.idx; k <= R.idx; k++) neck = Math.min(neck, recent[k].low);
+        const broken = last.close < neck;
+        return { fired: true, side: "bear", strength: broken ? 5 : 4, detail: `H&S — L$${L.price.toFixed(2)} H$${H.price.toFixed(2)} R$${R.price.toFixed(2)}, neck $${neck.toFixed(2)}${broken ? " BROKEN" : ""}` };
+      }
+    }
+  }
+  // Inverse H&S
+  if (ls.length >= 3) {
+    for (let i = 0; i <= ls.length - 3; i++) {
+      const L = ls[i], H = ls[i + 1], R = ls[i + 2];
+      if (H.price < L.price && H.price < R.price && Math.abs(L.price - R.price) / H.price < 0.04 && (L.price - H.price) / L.price > 0.02) {
+        let neck = -Infinity;
+        for (let k = L.idx; k <= R.idx; k++) neck = Math.max(neck, recent[k].high);
+        const broken = last.close > neck;
+        return { fired: true, side: "bull", strength: broken ? 5 : 4, detail: `Inverse H&S — neck $${neck.toFixed(2)}${broken ? " BROKEN" : ""}` };
+      }
+    }
+  }
+  return V2_NONE;
+}
+// ── 2.12 Trendline Break/Bounce ──
+function detectTrendlineTouch(data) {
+  if (data.length < 20) return V2_NONE;
+  const recent = data.slice(-30), atr = v2ATR(data), last = data[data.length - 1];
+  const hs = v2PivotHighs(recent, 3), ls = v2PivotLows(recent, 3);
+  // Downtrend line through last 3 pivot highs
+  if (hs.length >= 3) {
+    const pts = hs.slice(-3);
+    const slope = v2Slope(pts.map(p => p.price));
+    if (slope < 0) {
+      // Predict current value
+      const last_idx = pts[pts.length - 1].idx;
+      const predicted = pts[pts.length - 1].price + slope * (recent.length - 1 - last_idx);
+      const dist = (predicted - last.close) / atr;
+      const broken = last.close > predicted + atr * 0.3;
+      if (broken) return { fired: true, side: "bull", strength: 4, detail: `Downtrend line broken at $${predicted.toFixed(2)}` };
+      if (Math.abs(dist) < 0.5) return { fired: true, side: "bear", strength: 2, detail: `Approaching downtrend resistance $${predicted.toFixed(2)}` };
+    }
+  }
+  // Uptrend line through last 3 pivot lows
+  if (ls.length >= 3) {
+    const pts = ls.slice(-3);
+    const slope = v2Slope(pts.map(p => p.price));
+    if (slope > 0) {
+      const last_idx = pts[pts.length - 1].idx;
+      const predicted = pts[pts.length - 1].price + slope * (recent.length - 1 - last_idx);
+      const dist = (last.close - predicted) / atr;
+      const broken = last.close < predicted - atr * 0.3;
+      if (broken) return { fired: true, side: "bear", strength: 4, detail: `Uptrend line broken at $${predicted.toFixed(2)}` };
+      if (Math.abs(dist) < 0.5) return { fired: true, side: "bull", strength: 3, detail: `Bouncing off uptrend support $${predicted.toFixed(2)}` };
+    }
+  }
+  return V2_NONE;
+}
+// ── 2.13 MA Band Pullback/Bounce ──
+function detectMABandBounce(data) {
+  if (data.length < 25) return V2_NONE;
+  const closes = data.map(d => d.close), ma10 = v2SMA(closes, 10), ma20 = v2SMA(closes, 20);
+  const m10 = ma10[ma10.length - 1], m20 = ma20[ma20.length - 1];
+  if (!m10 || !m20) return V2_NONE;
+  const last = data[data.length - 1], atr = v2ATR(data);
+  const s10 = v2Slope(ma10.slice(-5).filter(v => v != null));
+  const s20 = v2Slope(ma20.slice(-5).filter(v => v != null));
+  const recentHigh = Math.max(...data.slice(-15).map(d => d.high));
+  // Bull: uptrend (MAs rising), price pulled down from recent high, now within 1 ATR of the band
+  if (s10 > 0 && s20 > 0 && last.close < recentHigh * 0.97 && Math.abs(last.close - m10) < atr && last.close >= Math.min(m10, m20) - atr * 0.3) {
+    return { fired: true, side: "bull", strength: 4, detail: `Pullback to rising 10/20 MA band ($${m20.toFixed(2)}-$${m10.toFixed(2)}), bounce setup` };
+  }
+  if (s10 < 0 && s20 < 0 && last.close > Math.min(...data.slice(-15).map(d => d.low)) * 1.03 && Math.abs(last.close - m10) < atr && last.close <= Math.max(m10, m20) + atr * 0.3) {
+    return { fired: true, side: "bear", strength: 4, detail: `Rally to falling 10/20 MA band ($${m10.toFixed(2)}-$${m20.toFixed(2)}), rejection setup` };
+  }
+  return V2_NONE;
+}
+// ── 2.14 Stacked MAs (reuse v1 via detectPatterns) ──
+function detectStackedMAs(data) {
+  const last = data[data.length - 1];
+  if (!last?.fastSMA || !last?.slowSMA || !last?.extraSMA || !last?.sma200) return V2_NONE;
+  if (last.fastSMA > last.slowSMA && last.slowSMA > last.extraSMA && last.extraSMA > last.sma200)
+    return { fired: true, side: "bull", strength: 3, detail: "Stacked bullish SMAs (10>20>50>200)" };
+  if (last.fastSMA < last.slowSMA && last.slowSMA < last.extraSMA && last.extraSMA < last.sma200)
+    return { fired: true, side: "bear", strength: 3, detail: "Stacked bearish SMAs (10<20<50<200)" };
+  return V2_NONE;
+}
+// ── 2.15 Failed Breakout / Trap ──
+function detectFailedBreakout(data, sr) {
+  if (data.length < 10 || !sr) return V2_NONE;
+  const recent = data.slice(-5), atr = v2ATR(data);
+  // Bull trap: closed above a resistance within last 5 bars, now back below
+  for (const r of (sr.resistance || [])) {
+    const abovePast = recent.some(b => b.close > r.avg + atr * 0.2);
+    const backBelow = recent[recent.length - 1].close < r.avg;
+    if (abovePast && backBelow) {
+      return { fired: true, side: "bear", strength: 4, detail: `Bull trap at $${r.avg.toFixed(2)} — broke out, reversed back below` };
+    }
+  }
+  // Bear trap
+  for (const s of (sr.support || [])) {
+    const belowPast = recent.some(b => b.close < s.avg - atr * 0.2);
+    const backAbove = recent[recent.length - 1].close > s.avg;
+    if (belowPast && backAbove) {
+      return { fired: true, side: "bull", strength: 4, detail: `Bear trap at $${s.avg.toFixed(2)} — broke down, reclaimed` };
+    }
+  }
+  return V2_NONE;
+}
+// ── 2.16 Liquidity Sweep / Stop Hunt ──
+function detectLiquiditySweep(data) {
+  if (data.length < 22) return V2_NONE;
+  const last = data[data.length - 1], atr = v2ATR(data);
+  const prior20 = data.slice(-22, -1);
+  const priorHigh = Math.max(...prior20.map(b => b.high)), priorLow = Math.min(...prior20.map(b => b.low));
+  // Bearish sweep: wicked above priorHigh but closed back below
+  if (last.high > priorHigh + atr * 0.3 && last.close < priorHigh && last.close < last.open) {
+    return { fired: true, side: "bear", strength: 5, detail: `Swept highs at $${priorHigh.toFixed(2)}, closed back inside — stop hunt` };
+  }
+  // Bullish sweep
+  if (last.low < priorLow - atr * 0.3 && last.close > priorLow && last.close > last.open) {
+    return { fired: true, side: "bull", strength: 5, detail: `Swept lows at $${priorLow.toFixed(2)}, closed back inside — stop hunt` };
+  }
+  return V2_NONE;
+}
+// ── 2.17 Fair Value Gap (FVG) ──
+function detectFVG(data) {
+  if (data.length < 5) return V2_NONE;
+  const atr = v2ATR(data), last = data[data.length - 1];
+  // Look at the last 20 bars for unfilled FVGs
+  const fvgs = [];
+  for (let i = 1; i < data.length - 1; i++) {
+    const a = data[i - 1], c = data[i + 1];
+    if (a.high < c.low) {
+      // bullish FVG between a.high and c.low
+      fvgs.push({ side: "bull", top: c.low, bot: a.high, idx: i });
+    } else if (a.low > c.high) {
+      fvgs.push({ side: "bear", top: a.low, bot: c.high, idx: i });
+    }
+  }
+  // Unfilled = price hasn't traded back through
+  const unfilled = fvgs.filter(g => {
+    for (let j = g.idx + 2; j < data.length; j++) {
+      if (g.side === "bull" && data[j].low < g.bot) return false;
+      if (g.side === "bear" && data[j].high > g.top) return false;
+    } return true;
+  });
+  if (!unfilled.length) return V2_NONE;
+  // Nearest unfilled to current price, within 1 ATR
+  const nearest = unfilled.reduce((best, g) => {
+    const mid = (g.top + g.bot) / 2; const d = Math.abs(last.close - mid);
+    return !best || d < best.d ? { g, d, mid } : best;
+  }, null);
+  if (!nearest || nearest.d > atr * 2) return V2_NONE;
+  return { fired: true, side: nearest.g.side, strength: 3, detail: `Unfilled ${nearest.g.side} FVG $${nearest.g.bot.toFixed(2)}-$${nearest.g.top.toFixed(2)}, ${(nearest.d / atr).toFixed(1)} ATR away` };
+}
+// ── 2.18 MACD Zero-Line Cross ──
+function detectMACDZero(data) {
+  if (data.length < 30) return V2_NONE;
+  const macdObj = computeMACD(data);
+  const line = macdObj.macd, n = line.length;
+  if (n < 4) return V2_NONE;
+  const recent = line.slice(-3), prev = line.slice(-5, -2);
+  const crossedUp = prev.some(v => v < 0) && recent[recent.length - 1] > 0 && recent.every(v => v >= prev[0] || v > 0);
+  const crossedDown = prev.some(v => v > 0) && recent[recent.length - 1] < 0 && recent.every(v => v <= prev[0] || v < 0);
+  if (crossedUp) return { fired: true, side: "bull", strength: 4, detail: "MACD crossed above zero — bullish regime" };
+  if (crossedDown) return { fired: true, side: "bear", strength: 4, detail: "MACD crossed below zero — bearish regime" };
+  return V2_NONE;
+}
+// ── 2.19 VWAP Reclaim/Rejection (hourly) ──
+function detectVWAPAction(data) {
+  if (data.length < 10) return V2_NONE;
+  const last = data[data.length - 1];
+  if (last.vwap == null) return V2_NONE;
+  const recent5 = data.slice(-5);
+  const wasBelow = recent5.slice(0, -1).some(b => b.vwap != null && b.close < b.vwap);
+  const wasAbove = recent5.slice(0, -1).some(b => b.vwap != null && b.close > b.vwap);
+  const nowAbove = last.close > last.vwap, nowBelow = last.close < last.vwap;
+  const volAvg = data.slice(-20).reduce((s, d) => s + (d.volume || 0), 0) / 20;
+  const volOK = (last.volume || 0) > volAvg * 1.1;
+  if (wasBelow && nowAbove) return { fired: true, side: "bull", strength: volOK ? 4 : 3, detail: "Reclaimed VWAP from below" };
+  if (wasAbove && nowBelow) return { fired: true, side: "bear", strength: volOK ? 4 : 3, detail: "Rejected back below VWAP" };
+  return V2_NONE;
+}
+// ── 2.20 Rising/Falling Wedge ──
+function detectWedge(data) {
+  if (data.length < 25) return V2_NONE;
+  const recent = data.slice(-25), atr = v2ATR(data), last = recent[recent.length - 1];
+  const hs = v2PivotHighs(recent, 2), ls = v2PivotLows(recent, 2);
+  if (hs.length < 2 || ls.length < 2) return V2_NONE;
+  const hSlope = v2Slope(hs.map(p => p.price)), lSlope = v2Slope(ls.map(p => p.price));
+  // Rising wedge: both slopes positive, lSlope > hSlope (converging up) → bearish
+  if (hSlope > 0 && lSlope > 0 && lSlope > hSlope * 1.3) {
+    const topNow = hs[hs.length - 1].price + hSlope * (recent.length - 1 - hs[hs.length - 1].idx);
+    const broke = last.close < ls[ls.length - 1].price - atr * 0.2;
+    return { fired: true, side: "bear", strength: broke ? 4 : 3, detail: `Rising wedge (bearish)${broke ? " — lower line broken" : ""}` };
+  }
+  // Falling wedge: both slopes negative, hSlope more negative (converging down) → bullish
+  if (hSlope < 0 && lSlope < 0 && hSlope < lSlope * 1.3) {
+    const broke = last.close > hs[hs.length - 1].price + atr * 0.2;
+    return { fired: true, side: "bull", strength: broke ? 4 : 3, detail: `Falling wedge (bullish)${broke ? " — upper line broken" : ""}` };
+  }
+  return V2_NONE;
+}
+// ── 2.21 Relative Strength vs SPY ──
+function detectRSvsSPY(data, regime) {
+  if (!regime?.SPY || data.length < 6) return V2_NONE;
+  const last = data[data.length - 1], prior = data[data.length - 6];
+  if (!prior) return V2_NONE;
+  const stockPct = ((last.close - prior.close) / prior.close) * 100;
+  const spyPct = parseFloat(regime.SPY.pct5d ?? 0);
+  const diff = stockPct - spyPct;
+  if (Math.abs(diff) < 1) return V2_NONE;
+  const side = diff > 0 ? "bull" : "bear";
+  const strength = Math.abs(diff) > 3 ? 4 : Math.abs(diff) > 2 ? 3 : 2;
+  return { fired: true, side, strength, detail: `5d RS: ${stockPct.toFixed(1)}% vs SPY ${spyPct.toFixed(1)}% (${diff > 0 ? "+" : ""}${diff.toFixed(1)}%)` };
+}
+// ── 2.22 52-Week Extreme ──
+function detectYearExtreme(data) {
+  if (data.length < 20) return V2_NONE;
+  const last = data[data.length - 1];
+  const window = data.slice(-Math.min(252, data.length - 1));
+  const hi = Math.max(...window.map(d => d.high)), lo = Math.min(...window.map(d => d.low));
+  const volAvg = data.slice(-20).reduce((s, d) => s + (d.volume || 0), 0) / 20;
+  const volOK = (last.volume || 0) > volAvg * 1.3;
+  if (last.close >= hi * 0.998) return { fired: true, side: "bull", strength: volOK ? 5 : 4, detail: `At/through ${window.length}-bar high $${hi.toFixed(2)}${volOK ? " with volume" : ""}` };
+  if (last.close >= hi * 0.98) return { fired: true, side: "bull", strength: 3, detail: `Within 2% of ${window.length}-bar high $${hi.toFixed(2)}` };
+  if (last.close <= lo * 1.002) return { fired: true, side: "bear", strength: volOK ? 5 : 4, detail: `At/through ${window.length}-bar low $${lo.toFixed(2)}${volOK ? " with volume" : ""}` };
+  if (last.close <= lo * 1.02) return { fired: true, side: "bear", strength: 3, detail: `Within 2% of ${window.length}-bar low $${lo.toFixed(2)}` };
+  return V2_NONE;
+}
+// ── 2.23 Bollinger Band Squeeze ──
+function detectBBSqueeze(data) {
+  if (data.length < 65) return V2_NONE;
+  const closes = data.map(d => d.close);
+  const bbWidth = [];
+  for (let i = 19; i < closes.length; i++) {
+    const slice = closes.slice(i - 19, i + 1);
+    const mean = slice.reduce((a, b) => a + b, 0) / 20;
+    const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / 20;
+    const sd = Math.sqrt(variance);
+    bbWidth.push((sd * 4) / mean); // (upper - lower) / mean, where bands = mean ± 2sd
+  }
+  if (bbWidth.length < 60) return V2_NONE;
+  const window = bbWidth.slice(-60), currentWidth = window[window.length - 1];
+  const sorted = [...window].sort((a, b) => a - b);
+  const p20 = sorted[Math.floor(sorted.length * 0.2)];
+  const inSqueeze = currentWidth <= p20;
+  if (!inSqueeze) return V2_NONE;
+  const last = data[data.length - 1];
+  const mean20 = closes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+  const sd20 = Math.sqrt(closes.slice(-20).reduce((a, b) => a + (b - mean20) ** 2, 0) / 20);
+  const upper = mean20 + 2 * sd20, lower = mean20 - 2 * sd20;
+  if (last.close > upper) return { fired: true, side: "bull", strength: 5, detail: `BB squeeze → breakout UP above $${upper.toFixed(2)}` };
+  if (last.close < lower) return { fired: true, side: "bear", strength: 5, detail: `BB squeeze → breakdown below $${lower.toFixed(2)}` };
+  // Neutral squeeze: bias from short-term trend
+  const shortTrend = v2Slope(closes.slice(-5)) > 0 ? "bull" : "bear";
+  return { fired: true, side: shortTrend, strength: 3, detail: `BB squeeze active (bottom 20% of 60-bar width) — coiled for breakout` };
+}
+// ── 2.24 Higher-Timeframe Alignment (multiplier, not in signals list) ──
+function v2HTFMultiplier(dailyNetScore, hourlyNetScore) {
+  if (dailyNetScore === 0 || hourlyNetScore === 0) return 1;
+  const sameDir = Math.sign(dailyNetScore) === Math.sign(hourlyNetScore);
+  return sameDir ? 1.25 : 0.85;
+}
+
+// ─── V2 Signal weights ───
+const V2_WEIGHTS = {
+  bullFlag: { D: 5, H: 4 }, bearFlag: { D: 5, H: 4 }, pennant: { D: 5, H: 4 },
+  retestBreak: { D: 5, H: 4 }, cupHandle: { D: 5, H: 3 }, headShoulders: { D: 5, H: 3 },
+  triangle: { D: 4, H: 3 }, volumeSurge: { D: 4, H: 4 }, maCurl: { D: 4, H: 3 },
+  trendline: { D: 4, H: 3 }, maBandBounce: { D: 3, H: 3 }, divergence: { D: 3, H: 2 },
+  stackedMAs: { D: 3, H: 2 }, failedBreakout: { D: 5, H: 4 }, liquiditySweep: { D: 4, H: 5 },
+  fvg: { D: 2, H: 3 }, macdZero: { D: 4, H: 3 }, vwapAction: { D: 0, H: 4 },
+  wedge: { D: 4, H: 3 }, rsVsSPY: { D: 4, H: 2 }, yearExtreme: { D: 4, H: 2 },
+  bbSqueeze: { D: 4, H: 3 },
+};
+
+// ─── Run all signals for one timeframe ───
+function runV2Signals(data, sr, divResult, regime, isHourly) {
+  const tf = isHourly ? "H" : "D", signals = [];
+  const push = (name, fn) => {
+    const s = fn();
+    if (s && s.fired) {
+      const w = (V2_WEIGHTS[name]?.[tf]) ?? 0;
+      if (w > 0) signals.push({ name, tf, side: s.side, strength: s.strength, weight: w, detail: s.detail });
+    }
+  };
+  push("bullFlag", () => detectBullFlag(data));
+  push("bearFlag", () => detectBearFlag(data));
+  push("pennant", () => detectPennant(data));
+  push("retestBreak", () => detectRetestBreak(data, sr));
+  push("cupHandle", () => detectCupHandle(data));
+  push("headShoulders", () => detectHeadShoulders(data));
+  push("triangle", () => detectTriangle(data));
+  push("volumeSurge", () => detectVolumeSurge(data));
+  push("maCurl", () => detectMACurl(data));
+  push("trendline", () => detectTrendlineTouch(data));
+  push("maBandBounce", () => detectMABandBounce(data));
+  push("divergence", () => v2WrapDivergence(divResult));
+  push("stackedMAs", () => detectStackedMAs(data));
+  push("failedBreakout", () => detectFailedBreakout(data, sr));
+  push("liquiditySweep", () => detectLiquiditySweep(data));
+  push("fvg", () => detectFVG(data));
+  push("macdZero", () => detectMACDZero(data));
+  if (isHourly) push("vwapAction", () => detectVWAPAction(data));
+  push("wedge", () => detectWedge(data));
+  push("rsVsSPY", () => detectRSvsSPY(data, regime));
+  push("yearExtreme", () => detectYearExtreme(data));
+  push("bbSqueeze", () => detectBBSqueeze(data));
+  return signals;
+}
+
+// ─── Volume Context (for detail drawer) ───
+function v2VolumeContext(dData, hData) {
+  const dAvg20 = dData.slice(-25, -5).reduce((s, d) => s + (d.volume || 0), 0) / 20;
+  const dLast = dData[dData.length - 1].volume || 0;
+  const hAvg20 = hData.slice(-25, -5).reduce((s, d) => s + (d.volume || 0), 0) / 20;
+  const hLast = hData[hData.length - 1].volume || 0;
+  const dRel = dAvg20 ? dLast / dAvg20 : 0, hRel = hAvg20 ? hLast / hAvg20 : 0;
+  const d5avg = dData.slice(-5).reduce((s, d) => s + (d.volume || 0), 0) / 5;
+  const trend = d5avg > dAvg20 * 1.15 ? "accumulating" : d5avg < dAvg20 * 0.85 ? "drying up" : "normal";
+  return { dailyRelVol: dRel.toFixed(2), hourlyRelVol: hRel.toFixed(2), trend };
+}
+
+// ─── V2 Trade Ticket Builder ───
+function v2BuildTicket(direction, price, dATR, targets, sr, tier, dominantTF) {
+  if (direction === "STAY_PUT") return null;
+  const optionDir = direction === "CALL" ? "CALL" : "PUT";
+  // Strike
+  let increment = 1;
+  if (price >= 200) increment = 5;
+  else if (price >= 50) increment = 2.5;
+  const highIV = dATR / price > 0.03;
+  let strike;
+  if (optionDir === "CALL") strike = highIV ? Math.round(price / increment) * increment : Math.ceil((price * 1.01) / increment) * increment;
+  else strike = highIV ? Math.round(price / increment) * increment : Math.floor((price * 0.99) / increment) * increment;
+  const strikeKind = highIV ? "ATM" : "SLIGHTLY_OTM";
+  // Expiry
+  let expiryWindow = "2-4w";
+  if (tier === "STRONG" && dominantTF === "H") expiryWindow = "1-2w";
+  else if (tier === "STRONG") expiryWindow = "2-4w";
+  else if (tier === "WEAK") expiryWindow = "4-6w";
+  // Target: first T that's ~5-8% away, else first T past price
+  let targetStockPrice = null;
+  for (const t of targets) {
+    if (!t?.price) continue;
+    const mv = Math.abs(t.price - price) / price;
+    if (mv >= 0.04 && mv <= 0.12) { targetStockPrice = t.price; break; }
+  }
+  if (!targetStockPrice && targets[0]?.price) targetStockPrice = targets[0].price;
+  // Stop
+  let stopStockPrice;
+  if (optionDir === "CALL") {
+    const nearSupp = (sr.support || []).filter(s => s.avg < price).sort((a, b) => b.avg - a.avg)[0];
+    stopStockPrice = nearSupp ? Math.max(nearSupp.avg, price - 1.5 * dATR) : price - 1.5 * dATR;
+  } else {
+    const nearRes = (sr.resistance || []).filter(r => r.avg > price).sort((a, b) => a.avg - b.avg)[0];
+    stopStockPrice = nearRes ? Math.min(nearRes.avg, price + 1.5 * dATR) : price + 1.5 * dATR;
+  }
+  // Option P&L estimates: ~0.5 delta × ~16× leverage ≈ multiplier 8 on slightly-OTM
+  const leverage = highIV ? 6 : 8;
+  const targetMovePct = targetStockPrice ? ((targetStockPrice - price) / price) * (optionDir === "CALL" ? 1 : -1) : 0;
+  const stopMovePct = ((stopStockPrice - price) / price) * (optionDir === "CALL" ? 1 : -1);
+  const targetOptionPct = Math.max(0, Math.round(targetMovePct * 100 * leverage));
+  const stopOptionPct = Math.max(-75, Math.round(stopMovePct * 100 * leverage));
+  const rr = stopOptionPct !== 0 ? Math.abs(targetOptionPct / stopOptionPct) : 0;
+  return {
+    direction: optionDir, strike, strikeKind, expiryWindow,
+    targetStockPrice: +targetStockPrice?.toFixed(2) || null,
+    stopStockPrice: +stopStockPrice.toFixed(2),
+    targetOptionPct, stopOptionPct, rr: +rr.toFixed(2),
+  };
+}
+
+// ─── V2 MAIN ANALYZER ───
+function analyzeV2(dData, hData, dSR, hSR, earningsDate, regime) {
+  const last = dData[dData.length - 1];
+  const price = +last.close.toFixed(2);
+  const dATR = v2ATR(dData);
+  // Reuse v1 for divergence + scoreTF + targets
+  const daily = scoreTF(dData, false), hourly = scoreTF(hData, true);
+  const dDiv = detectDivergence(dData, 20), hDiv = detectDivergence(hData, 15);
+  const cDiv = combinedDivergence(dDiv, hDiv);
+  // Run all v2 signals on both timeframes
+  const daySignals = runV2Signals(dData, dSR, dDiv, regime, false);
+  const hourSignals = runV2Signals(hData, hSR, hDiv, regime, true);
+  const signals = [...daySignals, ...hourSignals];
+  // Compute net score per TF
+  const netScore = (sigs) => sigs.reduce((s, sig) => s + (sig.side === "bull" ? 1 : -1) * sig.weight * sig.strength, 0);
+  const dailyNet = netScore(daySignals), hourlyNet = netScore(hourSignals);
+  // Combine weighted: daily 1.0, hourly 0.7 for swing timeframe
+  let raw = dailyNet * 1.0 + hourlyNet * 0.7;
+  raw = raw * v2HTFMultiplier(dailyNet, hourlyNet);
+  const clamped = Math.max(-100, Math.min(100, raw));
+  let finalScore = 50 + clamped / 2;
+  // Direction
+  let direction;
+  if (Math.abs(finalScore - 50) < 3) direction = "STAY_PUT";
+  else direction = finalScore > 50 ? "CALL" : "PUT";
+  // Tier
+  const absDist = Math.abs(finalScore - 50);
+  let tier;
+  if (absDist >= 30) tier = "STRONG";
+  else if (absDist >= 15) tier = "MEDIUM";
+  else if (absDist >= 5) tier = "WEAK";
+  else tier = "AVOID";
+  // Guardrails
+  const notes = [];
+  const daysToEarn = earningsDate ? Math.round((new Date(earningsDate).getTime() - Date.now()) / (24 * 3600 * 1000)) : null;
+  if (daysToEarn != null && daysToEarn > 0 && daysToEarn <= 7 && (tier === "STRONG" || tier === "MEDIUM")) {
+    tier = tier === "STRONG" ? "MEDIUM" : "WEAK";
+    notes.push(`Earnings in ${daysToEarn}d — tier downgraded (IV crush risk)`);
+  }
+  if (direction === "CALL" && daily.rsi > 75) { tier = tier === "STRONG" ? "MEDIUM" : tier === "MEDIUM" ? "WEAK" : tier; notes.push(`Daily RSI ${daily.rsi} overbought — downgraded`); }
+  if (direction === "PUT" && daily.rsi < 25) { tier = tier === "STRONG" ? "MEDIUM" : tier === "MEDIUM" ? "WEAK" : tier; notes.push(`Daily RSI ${daily.rsi} oversold — downgraded`); }
+  const bullStrong = signals.some(s => s.side === "bull" && s.strength >= 4);
+  const bearStrong = signals.some(s => s.side === "bear" && s.strength >= 4);
+  if (bullStrong && bearStrong) { tier = "AVOID"; direction = "STAY_PUT"; notes.push("Signals conflict — high-strength bulls AND bears"); }
+  if (!signals.some(s => s.strength >= 4) && tier !== "AVOID") { tier = "WEAK"; notes.push("No high-strength signal fired — capped at WEAK"); }
+  if (regime?.SPY) {
+    const spyDir = regime.SPY.direction;
+    if ((direction === "CALL" && spyDir === "BEARISH") || (direction === "PUT" && spyDir === "BULLISH")) {
+      if (tier === "MEDIUM" || tier === "WEAK") { tier = tier === "MEDIUM" ? "WEAK" : "WEAK"; notes.push(`SPY regime ${spyDir} opposes direction — downgraded`); }
+    }
+  }
+  // Targets (reuse v1's engine) — returns an ARRAY of target objects
+  const v1Dir = direction === "CALL" ? "CALLS" : direction === "PUT" ? "PUTS" : "WAIT";
+  let targetsArr = [];
+  try { targetsArr = compute5Targets(v1Dir, price, dData, hData, dSR, hSR, dATR, v2ATR(hData), null, []) || []; }
+  catch (e) { targetsArr = []; }
+  // Dominant TF for ticket expiry logic
+  const dominantTF = Math.abs(hourlyNet) > Math.abs(dailyNet) * 1.5 ? "H" : "D";
+  const ticket = v2BuildTicket(direction, price, dATR, targetsArr, dSR, tier, dominantTF);
+  // Narrative
+  const topSigs = [...signals].sort((a, b) => (b.weight * b.strength) - (a.weight * a.strength)).slice(0, 4);
+  const narrative = topSigs.length
+    ? `${direction === "STAY_PUT" ? "No trade" : direction} (${tier}). Top signals: ${topSigs.map(s => `${s.name} [${s.tf}] ${s.side} str${s.strength}`).join("; ")}.${notes.length ? " Notes: " + notes.join("; ") + "." : ""}`
+    : `No strong signals detected — ${tier}.`;
+  // Volume / MA / Trendline context
+  const volCtx = v2VolumeContext(dData, hData);
+  const closes = dData.map(d => d.close);
+  const hCloses = hData.map(d => d.close);
+  const maCurl = {
+    daily10: v2Slope(v2SMA(closes, 10).slice(-5).filter(v => v != null)),
+    daily20: v2Slope(v2SMA(closes, 20).slice(-5).filter(v => v != null)),
+    hourly10: v2Slope(v2SMA(hCloses, 10).slice(-5).filter(v => v != null)),
+    hourly20: v2Slope(v2SMA(hCloses, 20).slice(-5).filter(v => v != null)),
+  };
+  return {
+    version: "v2", price, direction, tier, score: +finalScore.toFixed(1),
+    signals, tradeTicket: ticket, narrative,
+    daily, hourly, hDiv, dDiv, cDiv,
+    targets: targetsArr,
+    volumeContext: volCtx, maCurl, guardrailNotes: notes,
+    dailyNet, hourlyNet,
+  };
+}
+// ═════════════════════════════════════════════════════════════════════
+// ═══  END V2 ANALYSIS ENGINE  ════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════
+
 // ─── App ───
 export default function App() {
   const [ticker, setTicker] = useState(""), [dD, setDD] = useState(null), [hD, setHD] = useState(null), [dC, setDC] = useState(null), [hC, setHC] = useState(null);
   const [an, setAn] = useState(null), [ai, setAI] = useState(""), [aiL, setAIL] = useState(false), [err, setErr] = useState(""), [tab, setTab] = useState("trade");
   const [scans, setScans] = useState({}); // { AAPL: { ticker, grade, direction, price, targets }, ... }
   const [batchMode, setBatchMode] = useState(false);
+  const [analysisVersion, setAnalysisVersion] = useState("v1"); // v1 | v2 — gated toggle near batch
   const [batchLog, setBatchLog] = useState([]); // status messages
   const [batchPending, setBatchPending] = useState({}); // { MA: { daily: records, hourly: null }, ... }
   const [batchProcessing, setBatchProcessing] = useState(false);
@@ -2212,9 +2933,36 @@ export default function App() {
       if (!p.hourly) { log.push(`⚠ ${tkr}: missing hourly CSV — skipped`); skipped++; setBatchLog([...log]); continue; }
 
       try {
+        if (analysisVersion === "v2") {
+          const dSR = findSR(p.daily), hSR = findSR(p.hourly);
+          const v2 = analyzeV2(p.daily, p.hourly, dSR, hSR, earningsDates[tkr]?.date || earningsDates[tkr], newRegime);
+          const v1Dir = v2.direction === "CALL" ? "CALLS" : v2.direction === "PUT" ? "PUTS" : "WAIT";
+          const scan = {
+            ticker: tkr, version: "v2",
+            tier: v2.tier, score: v2.score,
+            grade: Math.round(v2.score / 10), // back-compat for sorting
+            direction: v1Dir, bias: v2.direction === "STAY_PUT" ? "Neutral" : v2.direction === "CALL" ? "Bullish" : "Bearish",
+            isReversal: false, price: v2.price,
+            t1: v2.targets[0]?.price?.toFixed(2) || "—", t2: v2.targets[1]?.price?.toFixed(2) || "—",
+            t3: v2.targets[2]?.price?.toFixed(2) || "—", t4: v2.targets[3]?.price?.toFixed(2) || "—",
+            t5: v2.targets[4]?.price?.toFixed(2) || "—", timestamp: new Date().toISOString(),
+            hDiv: v2.hDiv, dDiv: v2.dDiv, cDiv: v2.cDiv, divAdj: null,
+            tradeTicket: v2.tradeTicket, signals: v2.signals, narrative: v2.narrative,
+            volumeContext: v2.volumeContext, maCurl: v2.maCurl, guardrailNotes: v2.guardrailNotes,
+          };
+          setScans(prev => ({ ...prev, [tkr]: scan }));
+          saveResultToSupabase(scan);
+          rawDataRef.current[tkr] = { daily: p.daily, hourly: p.hourly };
+          const tierIcon = v2.tier === "STRONG" ? "🟢" : v2.tier === "MEDIUM" ? "🟡" : v2.tier === "WEAK" ? "⚪" : "⛔";
+          const dirIcon = v2.direction === "CALL" ? "📈" : v2.direction === "PUT" ? "📉" : "⏸";
+          const tk = v2.tradeTicket ? ` ${dirIcon} $${v2.tradeTicket.strike} ${v2.tradeTicket.expiryWindow}` : ` ${dirIcon}`;
+          log.push(`✅ ${tkr}: ${tierIcon} ${v2.tier}${tk} — score ${v2.score} — $${v2.price}`);
+          processed++;
+          continue;
+        }
         const trade = computePlan(p.daily, p.hourly, findSR(p.daily), findSR(p.hourly), earningsDates[tkr]?.date || earningsDates[tkr], newRegime);
         const scan = {
-          ticker: tkr, grade: trade.grade, direction: trade.direction, bias: trade.bias,
+          ticker: tkr, version: "v1", grade: trade.grade, direction: trade.direction, bias: trade.bias,
           isReversal: trade.reversalInfo?.isReversal || false, price: trade.price,
           t1: trade.targets[0]?.price?.toFixed(2) || "—", t2: trade.targets[1]?.price?.toFixed(2) || "—",
           t3: trade.targets[2]?.price?.toFixed(2) || "—", t4: trade.targets[3]?.price?.toFixed(2) || "—",
@@ -2241,7 +2989,7 @@ export default function App() {
     }
     setBatchLog([...log]);
     setBatchProcessing(false);
-  }, []);
+  }, [analysisVersion, earningsDates]);
 
   // Clear all scans
   const clearScans = () => {
@@ -2269,8 +3017,13 @@ export default function App() {
     setBatchMode(false);
     setAI("");
     setErr("");
-    // Run full analysis
-    const result = { trade: computePlan(raw.daily, raw.hourly, findSR(raw.daily), findSR(raw.hourly), earningsDates[tkr]?.date || earningsDates[tkr], regimeData), dSR: findSR(raw.daily), hSR: findSR(raw.hourly), dPat: detectPatterns(raw.daily, "Daily"), hPat: detectPatterns(raw.hourly, "Hourly"), gap: analyzeGapPot(raw.daily) };
+    // Run full analysis — both v1 detail (for existing sections) and v2 detail (if v2 scan)
+    const savedScan = scans[tkr];
+    const dSR = findSR(raw.daily), hSR = findSR(raw.hourly);
+    const result = { trade: computePlan(raw.daily, raw.hourly, dSR, hSR, earningsDates[tkr]?.date || earningsDates[tkr], regimeData), dSR, hSR, dPat: detectPatterns(raw.daily, "Daily"), hPat: detectPatterns(raw.hourly, "Hourly"), gap: analyzeGapPot(raw.daily) };
+    if (savedScan?.version === "v2") {
+      result.v2 = analyzeV2(raw.daily, raw.hourly, dSR, hSR, earningsDates[tkr]?.date || earningsDates[tkr], regimeData);
+    }
     setAn(result);
     setTab("trade");
   };
@@ -2498,6 +3251,12 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
         <input type="text" placeholder="TICKER" value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())} style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 5, padding: "4px 8px", color: "#00e676", fontFamily: "inherit", fontSize: 12, fontWeight: 700, width: 80, textAlign: "center", outline: "none" }} />
         {Object.keys(scans).length > 0 && <div style={{ background: "#7c3aed22", border: "1px solid #7c3aed44", borderRadius: 5, padding: "3px 8px", fontSize: 9, color: "#a78bfa", fontWeight: 700 }}>{Object.keys(scans).length} scans</div>}
         <button onClick={() => { setBatchMode(!batchMode); setViewMode("analysis"); }} style={{ background: batchMode && viewMode === "analysis" ? "#f59e0b22" : "transparent", border: `1px solid ${batchMode && viewMode === "analysis" ? "#f59e0b" : "#1e293b"}`, borderRadius: 5, padding: "4px 8px", color: batchMode && viewMode === "analysis" ? "#f59e0b" : "#64748b", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>{batchMode ? "⚡ SINGLE" : "📦 BATCH"}</button>
+        {/* V2 analysis toggle — set BEFORE dropping files into batch */}
+        <div title={batchProcessing ? "Locked while batch is running" : "Choose analysis engine before dropping files"} style={{ display: "flex", alignItems: "center", gap: 4, background: "#0b1220", border: "1px solid #1e293b", borderRadius: 5, padding: "2px", opacity: batchProcessing ? 0.4 : 1, pointerEvents: batchProcessing ? "none" : "auto" }}>
+          <span style={{ fontSize: 9, color: "#64748b", fontWeight: 700, padding: "0 4px", letterSpacing: 0.5 }}>ANALYSIS:</span>
+          <button onClick={() => setAnalysisVersion("v1")} style={{ background: analysisVersion === "v1" ? "#3b82f633" : "transparent", border: `1px solid ${analysisVersion === "v1" ? "#3b82f6" : "transparent"}`, borderRadius: 3, padding: "3px 8px", color: analysisVersion === "v1" ? "#60a5fa" : "#64748b", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>v1</button>
+          <button onClick={() => setAnalysisVersion("v2")} style={{ background: analysisVersion === "v2" ? "#22c55e33" : "transparent", border: `1px solid ${analysisVersion === "v2" ? "#22c55e" : "transparent"}`, borderRadius: 3, padding: "3px 8px", color: analysisVersion === "v2" ? "#4ade80" : "#64748b", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>v2</button>
+        </div>
         <button onClick={async () => { if (viewMode === "history") { setViewMode("analysis"); } else { setViewMode("history"); setHistoryLoading(true); const data = await fetchHistoryFromSupabase(); setHistory(data); setHistoryLoading(false); }}} style={{ background: viewMode === "history" ? "#7c3aed22" : "transparent", border: `1px solid ${viewMode === "history" ? "#7c3aed" : "#1e293b"}`, borderRadius: 5, padding: "4px 8px", color: viewMode === "history" ? "#a78bfa" : "#64748b", fontFamily: "inherit", fontSize: 9, fontWeight: 700, cursor: "pointer" }}>📜 HISTORY</button>
       </div>
 
@@ -2747,9 +3506,9 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
                 const dc = s.direction === "CALLS" ? "#00e676" : s.direction === "PUTS" ? "#ff1744" : "#ffd600";
                 return (
                   <div key={s.ticker} onDoubleClick={() => loadScan(s.ticker)} title={rawDataRef.current[s.ticker] ? `Double-click to open ${s.ticker} full analysis` : `${s.ticker}: re-upload to enable full view`} style={{ display: "grid", gridTemplateColumns: "55px 30px 55px 52px 52px 52px 52px 52px 52px 70px 60px 60px 70px", gap: 2, padding: "4px 6px", borderBottom: "1px solid #1e293b11", fontSize: 10, cursor: "pointer", transition: "background 0.15s", minWidth: 700 }} onMouseEnter={e => e.currentTarget.style.background = "rgba(124,58,237,0.08)"} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-                    <div style={{ fontWeight: 800, color: "#e2e8f0" }}>{s.ticker}</div>
-                    <div style={{ fontWeight: 800, color: s.grade >= 7 ? "#00e676" : s.grade >= 5 ? "#ffd600" : "#ff1744" }}>{s.grade}</div>
-                    <div style={{ fontWeight: 700, color: dc, fontSize: 9 }}>{s.isReversal ? "🔄" : ""}{s.direction === "CALLS" ? "📈CALL" : s.direction === "PUTS" ? "📉PUT" : "⏸WAIT"}</div>
+                    <div style={{ fontWeight: 800, color: "#e2e8f0" }}>{s.ticker}{s.version === "v2" ? <span style={{ fontSize: 6, color: "#4ade80", marginLeft: 2, verticalAlign: "super" }}>v2</span> : ""}</div>
+                    <div style={{ fontWeight: 800, color: s.version === "v2" ? (s.tier === "STRONG" ? "#00e676" : s.tier === "MEDIUM" ? "#ffd600" : s.tier === "WEAK" ? "#94a3b8" : "#ff1744") : (s.grade >= 7 ? "#00e676" : s.grade >= 5 ? "#ffd600" : "#ff1744") }} title={s.version === "v2" ? `${s.tier} — v2 score ${s.score}/100` : `Grade ${s.grade}/10`}>{s.version === "v2" ? (s.tier === "STRONG" ? "S" : s.tier === "MEDIUM" ? "M" : s.tier === "WEAK" ? "W" : "⛔") : s.grade}</div>
+                    <div style={{ fontWeight: 700, color: dc, fontSize: 9 }}>{s.isReversal ? "🔄" : ""}{s.direction === "CALLS" ? "📈CALL" : s.direction === "PUTS" ? "📉PUT" : "⏸WAIT"}{s.version === "v2" && s.tradeTicket ? <span style={{ fontSize: 7, color: "#94a3b8", marginLeft: 2 }}>${s.tradeTicket.strike}</span> : ""}</div>
                     <div style={{ color: "#94a3b8" }}>${s.price}</div>
                     <div style={{ color: "#cbd5e1" }}>${s.t1}</div>
                     <div style={{ color: "#cbd5e1" }}>${s.t2}</div>
@@ -2846,6 +3605,89 @@ Valid values for "sentiment": "bullish", "bearish", "neutral"`;
             <div style={{ marginTop: 4, fontSize: 10, color: "#cbd5e1", padding: "4px 8px", background: "rgba(0,0,0,0.2)", borderRadius: 4 }}>{t.alignment}</div>
             <div style={{ fontSize: 9, color: "#94a3b8", marginTop: 2 }}>{t.confidence}</div>
           </Card>
+
+          {/* ═══ V2 TRADE TICKET + SIGNALS (v2 scans only) ═══ */}
+          {an.v2 && (() => {
+            const v = an.v2;
+            const tierColor = v.tier === "STRONG" ? "#00e676" : v.tier === "MEDIUM" ? "#ffd600" : v.tier === "WEAK" ? "#94a3b8" : "#ff1744";
+            const dirColor = v.direction === "CALL" ? "#00e676" : v.direction === "PUT" ? "#ff1744" : "#ffd600";
+            return (
+              <Card accent={tierColor} title={`🎯 V2 Trade Ticket — ${v.tier}${v.direction !== "STAY_PUT" ? ` · ${v.direction}` : ""}`}>
+                {v.tradeTicket ? (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 6, marginBottom: 8 }}>
+                    <div style={{ background: "rgba(17,24,39,0.6)", border: `1px solid ${dirColor}44`, borderRadius: 5, padding: 6 }}>
+                      <div style={{ fontSize: 8, color: "#64748b", fontWeight: 700, letterSpacing: 1 }}>DIRECTION</div>
+                      <div style={{ fontSize: 14, fontWeight: 900, color: dirColor }}>{v.direction === "CALL" ? "📈 CALL" : "📉 PUT"}</div>
+                      <div style={{ fontSize: 8, color: "#94a3b8" }}>{v.tradeTicket.strikeKind.replace("_", " ")}</div>
+                    </div>
+                    <div style={{ background: "rgba(17,24,39,0.6)", border: "1px solid #1e293b", borderRadius: 5, padding: 6 }}>
+                      <div style={{ fontSize: 8, color: "#64748b", fontWeight: 700, letterSpacing: 1 }}>STRIKE</div>
+                      <div style={{ fontSize: 14, fontWeight: 900, color: "#e2e8f0" }}>${v.tradeTicket.strike}</div>
+                    </div>
+                    <div style={{ background: "rgba(17,24,39,0.6)", border: "1px solid #1e293b", borderRadius: 5, padding: 6 }}>
+                      <div style={{ fontSize: 8, color: "#64748b", fontWeight: 700, letterSpacing: 1 }}>EXPIRY</div>
+                      <div style={{ fontSize: 14, fontWeight: 900, color: "#00b0ff" }}>{v.tradeTicket.expiryWindow}</div>
+                    </div>
+                    <div style={{ background: "rgba(0,230,118,0.08)", border: "1px solid #00e67633", borderRadius: 5, padding: 6 }}>
+                      <div style={{ fontSize: 8, color: "#00e676", fontWeight: 700, letterSpacing: 1 }}>TARGET (stock)</div>
+                      <div style={{ fontSize: 13, fontWeight: 900, color: "#e2e8f0" }}>${v.tradeTicket.targetStockPrice ?? "—"}</div>
+                      <div style={{ fontSize: 9, color: "#00e676", fontWeight: 700 }}>option ~+{v.tradeTicket.targetOptionPct}%</div>
+                    </div>
+                    <div style={{ background: "rgba(255,23,68,0.08)", border: "1px solid #ff174433", borderRadius: 5, padding: 6 }}>
+                      <div style={{ fontSize: 8, color: "#ff1744", fontWeight: 700, letterSpacing: 1 }}>STOP (stock)</div>
+                      <div style={{ fontSize: 13, fontWeight: 900, color: "#e2e8f0" }}>${v.tradeTicket.stopStockPrice}</div>
+                      <div style={{ fontSize: 9, color: "#ff1744", fontWeight: 700 }}>option ~{v.tradeTicket.stopOptionPct}%</div>
+                    </div>
+                    <div style={{ background: "rgba(124,58,237,0.08)", border: "1px solid #7c3aed33", borderRadius: 5, padding: 6 }}>
+                      <div style={{ fontSize: 8, color: "#a78bfa", fontWeight: 700, letterSpacing: 1 }}>R:R</div>
+                      <div style={{ fontSize: 14, fontWeight: 900, color: v.tradeTicket.rr >= 2 ? "#00e676" : v.tradeTicket.rr >= 1 ? "#ffd600" : "#ff1744" }}>{v.tradeTicket.rr}</div>
+                      <div style={{ fontSize: 8, color: "#94a3b8" }}>score {v.score}/100</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ padding: "8px 10px", background: "rgba(255,213,0,0.08)", border: "1px solid #ffd60033", borderRadius: 5, fontSize: 11, color: "#ffd600" }}>⏸ No trade ticket — tier AVOID or signals conflict. Stay on sidelines.</div>
+                )}
+                {/* Narrative */}
+                <div style={{ fontSize: 11, color: "#cbd5e1", lineHeight: 1.5, padding: "6px 10px", background: "rgba(0,0,0,0.3)", borderRadius: 4, marginBottom: 8 }}>{v.narrative}</div>
+                {/* Signals fired */}
+                <div style={{ fontSize: 9, fontWeight: 700, color: "#a78bfa", letterSpacing: 1, marginBottom: 4 }}>SIGNALS FIRED ({v.signals.length})</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                  {v.signals.length === 0 && <div style={{ fontSize: 10, color: "#64748b" }}>No signals fired.</div>}
+                  {[...v.signals].sort((a, b) => (b.weight * b.strength) - (a.weight * a.strength)).map((s, i) => {
+                    const sideColor = s.side === "bull" ? "#00e676" : "#ff1744";
+                    return (
+                      <div key={i} style={{ display: "grid", gridTemplateColumns: "30px 22px 90px 40px 1fr", gap: 6, alignItems: "center", padding: "3px 6px", background: "rgba(17,24,39,0.5)", borderLeft: `3px solid ${sideColor}`, borderRadius: 3, fontSize: 10 }}>
+                        <span style={{ fontSize: 8, fontWeight: 700, color: s.tf === "D" ? "#00b0ff" : "#f59e0b" }}>[{s.tf}]</span>
+                        <span style={{ color: sideColor, fontWeight: 800 }}>{s.side === "bull" ? "▲" : "▼"}</span>
+                        <span style={{ color: "#e2e8f0", fontWeight: 700 }}>{s.name}</span>
+                        <span style={{ fontSize: 9, color: "#94a3b8" }}>str {s.strength}·w{s.weight}</span>
+                        <span style={{ fontSize: 10, color: "#cbd5e1" }}>{s.detail}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                {/* Volume / MA curl / guardrails */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 8 }}>
+                  <div style={{ background: "rgba(0,176,255,0.06)", border: "1px solid #00b0ff33", borderRadius: 5, padding: 6 }}>
+                    <div style={{ fontSize: 8, fontWeight: 700, color: "#00b0ff", letterSpacing: 1 }}>VOLUME CONTEXT</div>
+                    <div style={{ fontSize: 10, color: "#e2e8f0" }}>Daily relVol <b>{v.volumeContext.dailyRelVol}×</b> · Hourly relVol <b>{v.volumeContext.hourlyRelVol}×</b></div>
+                    <div style={{ fontSize: 10, color: v.volumeContext.trend === "accumulating" ? "#00e676" : v.volumeContext.trend === "drying up" ? "#ff9800" : "#94a3b8" }}>Trend: {v.volumeContext.trend}</div>
+                  </div>
+                  <div style={{ background: "rgba(124,58,237,0.06)", border: "1px solid #7c3aed33", borderRadius: 5, padding: 6 }}>
+                    <div style={{ fontSize: 8, fontWeight: 700, color: "#a78bfa", letterSpacing: 1 }}>MA CURL (slope)</div>
+                    <div style={{ fontSize: 10, color: "#e2e8f0" }}>D10 {v.maCurl.daily10.toFixed(3)} · D20 {v.maCurl.daily20.toFixed(3)}</div>
+                    <div style={{ fontSize: 10, color: "#e2e8f0" }}>H10 {v.maCurl.hourly10.toFixed(3)} · H20 {v.maCurl.hourly20.toFixed(3)}</div>
+                  </div>
+                </div>
+                {v.guardrailNotes?.length > 0 && (
+                  <div style={{ marginTop: 8, padding: 6, background: "rgba(255,152,0,0.08)", border: "1px solid #ff980033", borderRadius: 5 }}>
+                    <div style={{ fontSize: 8, fontWeight: 700, color: "#ff9800", letterSpacing: 1, marginBottom: 3 }}>GUARDRAILS APPLIED</div>
+                    <div style={{ fontSize: 10, color: "#e2e8f0", lineHeight: 1.5 }}>{v.guardrailNotes.join(" · ")}</div>
+                  </div>
+                )}
+              </Card>
+            );
+          })()}
 
           {/* ═══ SAFEGUARD WARNINGS ═══ */}
           {t.extremeWarning && (
