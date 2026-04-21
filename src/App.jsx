@@ -29,7 +29,7 @@ async function saveResultToSupabase(scan) {
   }
 }
 
-// Delete rows older than 30 days (History tab retention window).async function deleteOldFromSupabase(days = 30) {  try {    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();    const { error } = await supabase      .from("analysis_results")      .delete()      .lt("analyzed_at", cutoff);    if (error) console.warn("Supabase cleanup error:", error.message);  } catch (e) {    console.warn("Supabase cleanup failed:", e.message);  }}async function fetchHistoryFromSupabase(limit = 200) {
+/* Delete rows older than 30 days (History tab retention window). */async function deleteOldFromSupabase(days = 30) {  try {    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();    const { error } = await supabase      .from("analysis_results")      .delete()      .lt("analyzed_at", cutoff);    if (error) console.warn("Supabase cleanup error:", error.message);  } catch (e) {    console.warn("Supabase cleanup failed:", e.message);  }}async function fetchHistoryFromSupabase(limit = 200) {
   try {
     const { data, error } = await supabase
       .from("analysis_results")
@@ -2141,7 +2141,7 @@ export default function App() {
 
 
   // ── BATCH MODE ──
-  const processBatchFiles = useCallback(async (files) => {    // Clean up rows older than 30 days before saving new batch results.    deleteOldFromSupabase(30);
+  const processBatchFiles = useCallback(async (files) => {    /* Clean up rows older than 30 days before saving new batch results. */    deleteOldFromSupabase(30);
     setBatchProcessing(true);
     const log = [];
     const pending = {};
